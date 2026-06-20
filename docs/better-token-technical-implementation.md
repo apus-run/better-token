@@ -1536,3 +1536,23 @@ Plugins 负责框架适配。
 ```text
 better-token core 只承认和管理 TokenState；token 包负责生成 token，storage 包负责保存状态，plugins 包负责接入框架，业务通过 context 获取 AuthContext。
 ```
+
+---
+
+## 28. 实现对齐说明（以代码为准）
+
+本文档第 1–27 节描述目标架构。以下几点在实现中已演进，**以代码为单一可信来源**：
+
+- **登录入参**：`Manager.Login(ctx, loginID string, token, opts...)` 以 `loginID string` 为入参（内部仍用 `LoginSubject` 建模、归一化 `LoginType`）。第 14 节中以 `LoginSubject` 为入参的签名为示意。
+- **登出命名**：实际为 `Logout(token)` / `LogoutByLoginID(loginID, opts...)` / `LogoutByDevice(loginID, device, opts...)`，取代第 14 节的 `LogoutSubject`。
+- **统一 Manager（无独立子 Manager）**：refresh / nonce / online 能力直接作为 `*core.Manager` 的方法暴露，并由统一接口 `core.TokenManager` 约束（含 RBAC `Check*`）。不存在独立的 `RefreshManager` / `NonceManager`。
+  - refresh：`LoginWithRefresh` / `Refresh` / `RevokeRefreshToken` / `RevokeRefreshByLoginID`，返回 `*LoginResult{TokenState, RefreshState}`。
+  - nonce：`GenerateNonce` / `ConsumeNonce`（返回 `*TokenState`）。
+  - online：`MarkOnline` / `MarkOffline` / `ListTokenStates` / `LogoutByDevice`。
+  - 配置：`core.WithRefreshConfig` / `core.WithNonceConfig`；统一 `Store` 天然支持全部 kind，无需独立的 refresh/nonce store 开关。
+- **统一 Store**：`Store` 仅含 TokenState + Session 方法；`FindTokenStates` / `DeleteTokenStates` 带 `kinds ...TokenKind` 过滤；新增原子 `ConsumeTokenState`。不存在 `RefreshStore` / `NonceStore` / `RefreshTokenState` / `NonceState`——refresh / nonce 均以 `Kind` 区分的统一 `TokenState`（配合 `RefreshInfo` / `NonceInfo`）表达，与第 8、9 节一致。
+- **错误模型**：`GetTokenState` 命中 `revoked` / `consumed` 返回 `ErrTokenInvalid`；新增 `ErrUnsupportedKind`。
+- **plugins 契约**：`plugins/contract.go` 提供框架无关的 `TokenLookup` / `Authenticate`（要求 `Kind==access`），由 `plugins/http`、`plugins/gin`、`plugins/grpc` 复用。
+- **第三阶段**：`plugins/grpc` 为独立 go module（server + client 拦截器）；`audit` 包提供独立 `AuditEventType` + 默认 slog Sink 的审计监听器。
+
+> 注：`token` 包的 `TokenConfig` / `JwtConfig` 目前位于 `token/jwt.go` 与 `token/generator.go`；第 2 节示意的 `token/config.go` 归位为可选清理项，尚未执行，不影响对外导出符号。

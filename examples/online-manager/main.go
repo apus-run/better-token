@@ -20,6 +20,11 @@ func main() {
 		log.Fatalf("login web: %v", err)
 	}
 
+	// 在 access token 上记录在线投影（IP / UA / 连接 ID）。
+	if err := manager.MarkOnline(ctx, "web-token", core.OnlineInfo{IP: "10.0.0.1", UserAgent: "chrome"}); err != nil {
+		log.Fatalf("mark online: %v", err)
+	}
+
 	states, err := manager.ListTokenStates(ctx, "1001")
 	if err != nil {
 		log.Fatalf("list online tokens: %v", err)
