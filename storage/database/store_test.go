@@ -35,8 +35,33 @@ func newStore(t *testing.T, opts ...dbstore.Option) *dbstore.Store {
 func tokenState(token, loginID, loginType string) *core.TokenState {
 	return &core.TokenState{
 		Token:     core.TokenValue(token),
+		Kind:      core.TokenKindAccess,
 		LoginID:   loginID,
 		LoginType: loginType,
+		Status:    core.TokenStatusActive,
+	}
+}
+
+func refreshState(token, loginID, loginType string) *core.TokenState {
+	return &core.TokenState{
+		Token:     core.TokenValue(token),
+		Kind:      core.TokenKindRefresh,
+		LoginID:   loginID,
+		LoginType: loginType,
+		Status:    core.TokenStatusActive,
+		CreatedAt: time.Now().UTC(),
+		Refresh:   &core.RefreshInfo{},
+	}
+}
+
+func nonceState(nonce string) *core.TokenState {
+	return &core.TokenState{
+		Token:     core.TokenValue(nonce),
+		Kind:      core.TokenKindNonce,
+		LoginID:   "1001",
+		Status:    core.TokenStatusActive,
+		CreatedAt: time.Now().UTC(),
+		Nonce:     &core.NonceInfo{},
 	}
 }
 
@@ -299,5 +324,76 @@ func TestStoreContextCancellation(t *testing.T) {
 	}
 	if _, err := store.FindTokenStates(ctx, core.LoginSubject{LoginID: "1001"}); err == nil {
 		t.Fatal("cancelled context should fail FindTokenStates")
+	}
+}
+
+func TestStoreRefreshTokenStateLifecycle(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	state := refreshState("r1", "1001", "login")
+	state.Refresh.AccessToken = "a1"
+	if err := store.SaveTokenState(ctx, state, time.Hour); err != nil {
+		t.Fatalf("SaveTokenState(refresh) failed: %v", err)
+	}
+	got, ok, err := store.GetTokenState(ctx, "r1")
+	if err != nil || !ok {
+		t.Fatalf("GetTokenState ok=%v err=%v", ok, err)
+	}
+	if got.LoginID != "1001" || got.Refresh == nil || got.Refresh.AccessToken != "a1" {
+		t.Fatalf("unexpected refresh state: %#v", got)
+	}
+	states, err := store.FindTokenStates(ctx, core.LoginSubject{LoginID: "1001"}, core.TokenKindRefresh)
+	if err != nil || len(states) != 1 {
+		t.Fatalf("FindTokenStates(refresh) len=%d err=%v", len(states), err)
+	}
+	if err := store.DeleteTokenState(ctx, "r1"); err != nil {
+		t.Fatalf("DeleteTokenState failed: %v", err)
+	}
+	if _, ok, _ := store.GetTokenState(ctx, "r1"); ok {
+		t.Fatal("refresh token should be deleted")
+	}
+}
+
+func TestStoreNonceConsumeIsSingleUse(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	state := nonceState("nonce-1")
+	exp := time.Now().Add(time.Minute).UTC()
+	state.ExpiresAt = &exp
+	if err := store.SaveTokenState(ctx, state, time.Minute); err != nil {
+		t.Fatalf("SaveTokenState(nonce) failed: %v", err)
+	}
+	first, ok, err := store.ConsumeTokenState(ctx, "nonce-1")
+	if err != nil || !ok {
+		t.Fatalf("first ConsumeTokenState ok=%v err=%v", ok, err)
+	}
+	if first.IsConsumed() {
+		t.Fatal("first consumed state should be fresh")
+	}
+	second, ok, err := store.ConsumeTokenState(ctx, "nonce-1")
+	if err != nil || !ok {
+		t.Fatalf("second ConsumeTokenState ok=%v err=%v", ok, err)
+	}
+	if !second.IsConsumed() {
+		t.Fatal("second consumed state should be marked consumed")
+	}
+}
+
+func TestStoreNonceConsumeEvictsExpiredRow(t *testing.T) {
+	clock, now := newClock(time.Date(2026, 6, 20, 8, 0, 0, 0, time.UTC))
+	store := newStore(t, dbstore.WithRuntime(core.Runtime{Now: now}))
+	ctx := context.Background()
+
+	if err := store.SaveTokenState(ctx, nonceState("nonce-expired"), time.Minute); err != nil {
+		t.Fatalf("SaveTokenState(nonce) failed: %v", err)
+	}
+	*clock = clock.Add(2 * time.Minute)
+	if _, ok, err := store.ConsumeTokenState(ctx, "nonce-expired"); err != nil || ok {
+		t.Fatalf("expired nonce should be evicted on consume, ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := store.ConsumeTokenState(ctx, "nonce-expired"); err != nil || ok {
+		t.Fatalf("expired nonce row should be evicted, ok=%v err=%v", ok, err)
 	}
 }

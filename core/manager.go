@@ -10,11 +10,13 @@ import (
 )
 
 type Manager struct {
-	config     Config
-	store      Store
-	authorizer Authorizer
-	eventBus   EventBus
-	runtime    Runtime
+	config        Config
+	store         Store
+	authorizer    Authorizer
+	eventBus      EventBus
+	runtime       Runtime
+	refreshConfig RefreshConfig
+	nonceConfig   NonceConfig
 }
 
 func NewManager(store Store, opts ...Option) *Manager {
@@ -23,13 +25,17 @@ func NewManager(store Store, opts ...Option) *Manager {
 	}
 
 	m := &Manager{
-		config:     DefaultConfig(),
-		store:      store,
-		authorizer: NoopAuthorizer{},
-		eventBus:   NewEventBus(),
-		runtime:    DefaultRuntime(),
+		config:        DefaultConfig(),
+		store:         store,
+		authorizer:    NoopAuthorizer{},
+		eventBus:      NewEventBus(),
+		runtime:       DefaultRuntime(),
+		refreshConfig: DefaultRefreshConfig(),
+		nonceConfig:   DefaultNonceConfig(),
 	}
 	option.Apply(m, opts...)
+	m.refreshConfig = m.refreshConfig.withDefaults()
+	m.nonceConfig = m.nonceConfig.withDefaults()
 	return m
 }
 
@@ -38,6 +44,12 @@ func (m *Manager) Config() Config {
 }
 
 func (m *Manager) Login(ctx context.Context, loginID string, token TokenValue, opts ...LoginOption) (*TokenState, error) {
+	loginOpts := loginOptions{loginType: DefaultLoginType}
+	option.Apply(&loginOpts, opts...)
+	return m.login(ctx, loginID, token, loginOpts, true)
+}
+
+func (m *Manager) login(ctx context.Context, loginID string, token TokenValue, loginOpts loginOptions, enforceNonce bool) (*TokenState, error) {
 	ctx = normalizeContext(ctx)
 	loginID = strings.TrimSpace(loginID)
 	if loginID == "" {
@@ -48,25 +60,34 @@ func (m *Manager) Login(ctx context.Context, loginID string, token TokenValue, o
 		return nil, ErrEmptyToken
 	}
 
-	loginOpts := loginOptions{loginType: DefaultLoginType}
-	option.Apply(&loginOpts, opts...)
+	if enforceNonce && m.config.RequireNonce {
+		if loginOpts.nonce == "" {
+			return nil, ErrEmptyNonce
+		}
+		if _, err := m.ConsumeNonce(ctx, loginOpts.nonce); err != nil {
+			return nil, err
+		}
+	}
 
 	now := m.now()
 	subject := LoginSubject{LoginID: loginID, LoginType: loginOpts.loginType}.Normalize()
 	if m.config.ShareToken {
-		states, err := m.store.FindTokenStates(ctx, subject)
+		states, err := m.store.FindTokenStates(ctx, subject, TokenKindAccess)
 		if err != nil {
 			return nil, err
 		}
 		for _, state := range states {
-			if state != nil && !state.IsExpired(now) {
+			if state != nil && state.IsActive(now) {
 				return state.Clone(), nil
 			}
 		}
 	}
 
 	if !m.config.Concurrent {
-		if err := m.store.DeleteTokenStates(ctx, subject); err != nil {
+		if err := m.store.DeleteTokenStates(ctx, subject, TokenKindAccess); err != nil {
+			return nil, err
+		}
+		if err := m.revokeRefreshForSubject(ctx, subject); err != nil {
 			return nil, err
 		}
 		m.publish(ctx, Event{
@@ -87,12 +108,14 @@ func (m *Manager) Login(ctx context.Context, loginID string, token TokenValue, o
 	}
 	state := &TokenState{
 		Token:        token,
+		Kind:         TokenKindAccess,
 		LoginID:      subject.LoginID,
 		LoginType:    subject.LoginType,
 		Device:       loginOpts.device,
 		CreatedAt:    now,
 		LastActiveAt: now,
 		ExpiresAt:    expiresAt,
+		Status:       TokenStatusActive,
 		Metadata:     cloneRawMessage(loginOpts.metadata),
 	}
 	if err := m.store.SaveTokenState(ctx, state, ttl); err != nil {
@@ -129,6 +152,11 @@ func (m *Manager) getTokenState(ctx context.Context, token TokenValue, allowAuto
 	}
 	if !ok {
 		return nil, ErrTokenNotFound
+	}
+	state.Normalize()
+
+	if state.IsRevoked() || state.IsConsumed() {
+		return nil, ErrTokenInvalid
 	}
 
 	now := m.now()
@@ -223,6 +251,9 @@ func (m *Manager) Logout(ctx context.Context, token TokenValue) error {
 	if err := m.store.DeleteTokenState(ctx, token); err != nil {
 		return err
 	}
+	if err := m.revokeRefreshForAccessToken(ctx, state); err != nil {
+		return err
+	}
 	m.publish(ctx, Event{
 		Type:      EventLogout,
 		LoginID:   state.LoginID,
@@ -243,7 +274,10 @@ func (m *Manager) LogoutByLoginID(ctx context.Context, loginID string, opts ...L
 	option.Apply(&logoutOpts, opts...)
 
 	subject := LoginSubject{LoginID: loginID, LoginType: logoutOpts.loginType}.Normalize()
-	if err := m.store.DeleteTokenStates(ctx, subject); err != nil {
+	if err := m.store.DeleteTokenStates(ctx, subject, TokenKindAccess); err != nil {
+		return err
+	}
+	if err := m.revokeRefreshForSubject(ctx, subject); err != nil {
 		return err
 	}
 	if logoutOpts.deleteSession {
@@ -257,6 +291,34 @@ func (m *Manager) LogoutByLoginID(ctx context.Context, loginID string, opts ...L
 		LoginType: subject.LoginType,
 	})
 	return nil
+}
+
+// revokeRefreshForAccessToken 删除与给定 access token 关联的 refresh token 状态。
+func (m *Manager) revokeRefreshForAccessToken(ctx context.Context, state *TokenState) error {
+	if !m.refreshConfig.RevokeRefreshOnLogout || state == nil || state.Token == "" {
+		return nil
+	}
+	states, err := m.store.FindTokenStates(ctx, state.Subject(), TokenKindRefresh)
+	if err != nil {
+		return err
+	}
+	for _, rs := range states {
+		if rs == nil || rs.Refresh == nil || rs.Refresh.AccessToken != state.Token {
+			continue
+		}
+		if err := m.store.DeleteTokenState(ctx, rs.Token); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// revokeRefreshForSubject 删除某登录主体下的全部 refresh token 状态。
+func (m *Manager) revokeRefreshForSubject(ctx context.Context, subject LoginSubject) error {
+	if !m.refreshConfig.RevokeRefreshOnLogout {
+		return nil
+	}
+	return m.store.DeleteTokenStates(ctx, subject.Normalize(), TokenKindRefresh)
 }
 
 func (m *Manager) GetSession(ctx context.Context, loginID string, opts ...SessionOption) (*Session, error) {

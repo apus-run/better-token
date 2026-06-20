@@ -2,6 +2,7 @@ package memory_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,8 +18,33 @@ func newClock(t time.Time) (*time.Time, func() time.Time) {
 func tokenState(token, loginID, loginType string) *core.TokenState {
 	return &core.TokenState{
 		Token:     core.TokenValue(token),
+		Kind:      core.TokenKindAccess,
 		LoginID:   loginID,
 		LoginType: loginType,
+		Status:    core.TokenStatusActive,
+	}
+}
+
+func refreshState(token, loginID, loginType string) *core.TokenState {
+	return &core.TokenState{
+		Token:     core.TokenValue(token),
+		Kind:      core.TokenKindRefresh,
+		LoginID:   loginID,
+		LoginType: loginType,
+		Status:    core.TokenStatusActive,
+		CreatedAt: time.Now().UTC(),
+		Refresh:   &core.RefreshInfo{},
+	}
+}
+
+func nonceState(nonce string) *core.TokenState {
+	return &core.TokenState{
+		Nonce:     &core.NonceInfo{},
+		Token:     core.TokenValue(nonce),
+		Kind:      core.TokenKindNonce,
+		LoginID:   "1001",
+		Status:    core.TokenStatusActive,
+		CreatedAt: time.Now().UTC(),
 	}
 }
 
@@ -257,5 +283,124 @@ func TestStoreContextCancellation(t *testing.T) {
 	}
 	if _, err := store.FindTokenStates(ctx, core.LoginSubject{LoginID: "1001"}); err == nil {
 		t.Fatal("cancelled context should fail FindTokenStates")
+	}
+}
+
+func TestStoreRefreshTokenStateLifecycle(t *testing.T) {
+	store := memory.NewStore()
+	ctx := context.Background()
+
+	if err := store.SaveTokenState(ctx, refreshState("r1", "1001", "login"), time.Hour); err != nil {
+		t.Fatalf("SaveTokenState(refresh) failed: %v", err)
+	}
+	got, ok, err := store.GetTokenState(ctx, "r1")
+	if err != nil || !ok {
+		t.Fatalf("GetTokenState ok=%v err=%v", ok, err)
+	}
+	if got.LoginID != "1001" || got.Kind != core.TokenKindRefresh {
+		t.Fatalf("unexpected refresh state: %#v", got)
+	}
+	states, err := store.FindTokenStates(ctx, core.LoginSubject{LoginID: "1001"}, core.TokenKindRefresh)
+	if err != nil || len(states) != 1 {
+		t.Fatalf("FindTokenStates(refresh) len=%d err=%v", len(states), err)
+	}
+	// access kind 过滤应排除该 refresh token。
+	if access, _ := store.FindTokenStates(ctx, core.LoginSubject{LoginID: "1001"}, core.TokenKindAccess); len(access) != 0 {
+		t.Fatalf("access kind filter should exclude refresh, got %d", len(access))
+	}
+	if err := store.DeleteTokenState(ctx, "r1"); err != nil {
+		t.Fatalf("DeleteTokenState failed: %v", err)
+	}
+	if _, ok, _ := store.GetTokenState(ctx, "r1"); ok {
+		t.Fatal("refresh token should be deleted")
+	}
+}
+
+func TestStoreRefreshTokenStateTTLAppliesToGetAndConsume(t *testing.T) {
+	clock, now := newClock(time.Date(2026, 6, 20, 8, 0, 0, 0, time.UTC))
+	store := memory.NewStore(memory.WithRuntime(core.Runtime{Now: now}))
+	ctx := context.Background()
+
+	getState := refreshState("r-get", "1001", "login")
+	consumeState := refreshState("r-consume", "1001", "login")
+	exp := now().Add(time.Hour).UTC()
+	getState.ExpiresAt = &exp
+	consumeState.ExpiresAt = &exp
+	if err := store.SaveTokenState(ctx, getState, time.Minute); err != nil {
+		t.Fatalf("SaveTokenState get failed: %v", err)
+	}
+	if err := store.SaveTokenState(ctx, consumeState, time.Minute); err != nil {
+		t.Fatalf("SaveTokenState consume failed: %v", err)
+	}
+
+	*clock = clock.Add(2 * time.Minute)
+	if _, ok, err := store.GetTokenState(ctx, "r-get"); err != nil || ok {
+		t.Fatalf("expired refresh token get ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := store.ConsumeTokenState(ctx, "r-consume"); err != nil || ok {
+		t.Fatalf("expired refresh token consume ok=%v err=%v", ok, err)
+	}
+}
+
+func TestStoreFindRefreshTokenStatesEvictsExpired(t *testing.T) {
+	clock, now := newClock(time.Date(2026, 6, 20, 8, 0, 0, 0, time.UTC))
+	store := memory.NewStore(memory.WithRuntime(core.Runtime{Now: now}))
+	ctx := context.Background()
+
+	state := refreshState("r1", "1001", "login")
+	exp := now().Add(time.Minute)
+	state.ExpiresAt = &exp
+	if err := store.SaveTokenState(ctx, state, time.Minute); err != nil {
+		t.Fatalf("SaveTokenState failed: %v", err)
+	}
+	*clock = clock.Add(2 * time.Minute)
+	states, err := store.FindTokenStates(ctx, core.LoginSubject{LoginID: "1001"}, core.TokenKindRefresh)
+	if err != nil {
+		t.Fatalf("FindTokenStates failed: %v", err)
+	}
+	if len(states) != 0 {
+		t.Fatalf("expired refresh token should be evicted, got %d", len(states))
+	}
+}
+
+func TestStoreNonceConsumeIsSingleUse(t *testing.T) {
+	store := memory.NewStore()
+	ctx := context.Background()
+
+	state := nonceState("nonce-1")
+	exp := time.Now().Add(time.Minute).UTC()
+	state.ExpiresAt = &exp
+	if err := store.SaveTokenState(ctx, state, time.Minute); err != nil {
+		t.Fatalf("SaveTokenState(nonce) failed: %v", err)
+	}
+
+	const workers = 16
+	var wg sync.WaitGroup
+	successes := make(chan struct{}, workers)
+	replays := make(chan struct{}, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, ok, err := store.ConsumeTokenState(ctx, "nonce-1")
+			if err != nil || !ok {
+				t.Errorf("ConsumeTokenState ok=%v err=%v", ok, err)
+				return
+			}
+			if !got.IsConsumed() {
+				successes <- struct{}{}
+			} else {
+				replays <- struct{}{}
+			}
+		}()
+	}
+	wg.Wait()
+	close(successes)
+	close(replays)
+	if len(successes) != 1 {
+		t.Fatalf("expected exactly one fresh consume, got %d", len(successes))
+	}
+	if len(replays) != workers-1 {
+		t.Fatalf("expected %d replays, got %d", workers-1, len(replays))
 	}
 }

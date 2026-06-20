@@ -31,6 +31,18 @@ func WithEventBus(eventBus EventBus) Option {
 	}
 }
 
+func WithNonceConfig(config NonceConfig) Option {
+	return func(m *Manager) {
+		m.nonceConfig = config.withDefaults()
+	}
+}
+
+func WithRefreshConfig(config RefreshConfig) Option {
+	return func(m *Manager) {
+		m.refreshConfig = config.withDefaults()
+	}
+}
+
 func WithRuntime(runtime Runtime) Option {
 	return func(m *Manager) {
 		runtime.ensureDefaults()
@@ -44,6 +56,7 @@ type loginOptions struct {
 	loginType string
 	device    string
 	metadata  json.RawMessage
+	nonce     TokenValue
 }
 
 func WithLoginType(loginType string) LoginOption {
@@ -63,6 +76,12 @@ func WithDevice(device string) LoginOption {
 func WithMetadata(metadata json.RawMessage) LoginOption {
 	return func(opts *loginOptions) {
 		opts.metadata = cloneRawMessage(metadata)
+	}
+}
+
+func WithNonce(nonce TokenValue) LoginOption {
+	return func(opts *loginOptions) {
+		opts.nonce = TokenValue(strings.TrimSpace(string(nonce)))
 	}
 }
 

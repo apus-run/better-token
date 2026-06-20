@@ -10,6 +10,7 @@ type authContextKey struct{}
 
 type AuthContext struct {
 	Token     TokenValue      `json:"token"`
+	Kind      TokenKind       `json:"kind,omitempty"`
 	LoginID   string          `json:"login_id"`
 	LoginType string          `json:"login_type"`
 	Device    string          `json:"device,omitempty"`
@@ -23,6 +24,7 @@ func NewAuthContext(state *TokenState) *AuthContext {
 	}
 	auth := &AuthContext{
 		Token:     state.Token,
+		Kind:      state.Kind,
 		LoginID:   state.LoginID,
 		LoginType: state.LoginType,
 		Device:    state.Device,

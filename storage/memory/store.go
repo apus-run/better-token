@@ -64,11 +64,9 @@ func (s *Store) SaveTokenState(ctx context.Context, state *core.TokenState, ttl 
 	if clone.Token == "" {
 		return core.ErrEmptyToken
 	}
-	if clone.LoginID == "" {
+	clone.Normalize()
+	if clone.LoginID == "" && clone.Kind != core.TokenKindNonce {
 		return core.ErrEmptyLoginID
-	}
-	if clone.LoginType == "" {
-		clone.LoginType = core.DefaultLoginType
 	}
 
 	expiresAt := expirationFromState(s.now(), clone, ttl)
@@ -120,6 +118,31 @@ func (s *Store) GetTokenState(ctx context.Context, token core.TokenValue) (*core
 	return item.state.Clone(), true, nil
 }
 
+func (s *Store) ConsumeTokenState(ctx context.Context, token core.TokenValue) (*core.TokenState, bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, false, err
+	}
+
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	item, ok := s.tokens[token]
+	if !ok || item.state == nil {
+		return nil, false, nil
+	}
+	if item.isExpired(now) {
+		s.deleteTokenLocked(token)
+		return nil, false, nil
+	}
+	// 返回消费前快照。
+	snapshot := item.state.Clone()
+	if item.state.IsActive(now) {
+		item.state.MarkConsumed(now)
+	}
+	return snapshot, true, nil
+}
+
 func (s *Store) DeleteTokenState(ctx context.Context, token core.TokenValue) error {
 	if err := contextErr(ctx); err != nil {
 		return err
@@ -131,12 +154,11 @@ func (s *Store) DeleteTokenState(ctx context.Context, token core.TokenValue) err
 	return nil
 }
 
-func (s *Store) FindTokenStates(ctx context.Context, subject core.LoginSubject) ([]*core.TokenState, error) {
+func (s *Store) FindTokenStates(ctx context.Context, subject core.LoginSubject, kinds ...core.TokenKind) ([]*core.TokenState, error) {
 	if err := contextErr(ctx); err != nil {
 		return nil, err
 	}
 	key := subject.Normalize()
-
 	now := s.now()
 
 	s.mu.Lock()
@@ -154,15 +176,18 @@ func (s *Store) FindTokenStates(ctx context.Context, subject core.LoginSubject) 
 			s.deleteTokenLocked(token)
 			continue
 		}
+		if !core.MatchKind(item.state.Kind, kinds...) {
+			continue
+		}
 		result = append(result, item.state.Clone())
 	}
-	if len(tokens) == 0 {
+	if len(s.indexes[key]) == 0 {
 		delete(s.indexes, key)
 	}
 	return result, nil
 }
 
-func (s *Store) DeleteTokenStates(ctx context.Context, subject core.LoginSubject) error {
+func (s *Store) DeleteTokenStates(ctx context.Context, subject core.LoginSubject, kinds ...core.TokenKind) error {
 	if err := contextErr(ctx); err != nil {
 		return err
 	}
@@ -172,9 +197,15 @@ func (s *Store) DeleteTokenStates(ctx context.Context, subject core.LoginSubject
 	defer s.mu.Unlock()
 
 	for token := range s.indexes[key] {
-		delete(s.tokens, token)
+		item, ok := s.tokens[token]
+		if !ok {
+			continue
+		}
+		if item.state != nil && !core.MatchKind(item.state.Kind, kinds...) {
+			continue
+		}
+		s.deleteTokenLocked(token)
 	}
-	delete(s.indexes, key)
 	return nil
 }
 
@@ -298,15 +329,7 @@ func expirationFromState(now time.Time, state *core.TokenState, ttl time.Duratio
 	if state == nil {
 		return nil
 	}
-	if ttl > 0 {
-		exp := now.Add(ttl).UTC()
-		return &exp
-	}
-	if state.ExpiresAt != nil {
-		exp := state.ExpiresAt.UTC()
-		return &exp
-	}
-	return nil
+	return state.EffectiveExpiresAt(now, ttl)
 }
 
 func contextErr(ctx context.Context) error {

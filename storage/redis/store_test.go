@@ -2,6 +2,7 @@ package redis_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,8 +26,33 @@ func newStore(t *testing.T) (*redisstore.Store, *miniredis.Miniredis) {
 func tokenState(token, loginID, loginType string) *core.TokenState {
 	return &core.TokenState{
 		Token:     core.TokenValue(token),
+		Kind:      core.TokenKindAccess,
 		LoginID:   loginID,
 		LoginType: loginType,
+		Status:    core.TokenStatusActive,
+	}
+}
+
+func refreshState(token, loginID, loginType string) *core.TokenState {
+	return &core.TokenState{
+		Token:     core.TokenValue(token),
+		Kind:      core.TokenKindRefresh,
+		LoginID:   loginID,
+		LoginType: loginType,
+		Status:    core.TokenStatusActive,
+		CreatedAt: time.Now().UTC(),
+		Refresh:   &core.RefreshInfo{},
+	}
+}
+
+func nonceState(nonce string) *core.TokenState {
+	return &core.TokenState{
+		Token:     core.TokenValue(nonce),
+		Kind:      core.TokenKindNonce,
+		LoginID:   "1001",
+		Status:    core.TokenStatusActive,
+		CreatedAt: time.Now().UTC(),
+		Nonce:     &core.NonceInfo{},
 	}
 }
 
@@ -259,5 +285,73 @@ func TestStoreContextCancellation(t *testing.T) {
 	}
 	if _, err := store.FindTokenStates(ctx, core.LoginSubject{LoginID: "1001"}); err == nil {
 		t.Fatal("cancelled context should fail FindTokenStates")
+	}
+}
+
+func TestStoreRefreshTokenStateLifecycle(t *testing.T) {
+	store, _ := newStore(t)
+	ctx := context.Background()
+
+	if err := store.SaveTokenState(ctx, refreshState("r1", "1001", "login"), time.Hour); err != nil {
+		t.Fatalf("SaveTokenState(refresh) failed: %v", err)
+	}
+	got, ok, err := store.GetTokenState(ctx, "r1")
+	if err != nil || !ok {
+		t.Fatalf("GetTokenState ok=%v err=%v", ok, err)
+	}
+	if got.LoginID != "1001" || got.Kind != core.TokenKindRefresh {
+		t.Fatalf("unexpected refresh state: %#v", got)
+	}
+	states, err := store.FindTokenStates(ctx, core.LoginSubject{LoginID: "1001"}, core.TokenKindRefresh)
+	if err != nil || len(states) != 1 {
+		t.Fatalf("FindTokenStates(refresh) len=%d err=%v", len(states), err)
+	}
+	if err := store.DeleteTokenStates(ctx, core.LoginSubject{LoginID: "1001"}, core.TokenKindRefresh); err != nil {
+		t.Fatalf("DeleteTokenStates(refresh) failed: %v", err)
+	}
+	if _, ok, _ := store.GetTokenState(ctx, "r1"); ok {
+		t.Fatal("refresh token should be deleted")
+	}
+}
+
+func TestStoreNonceConsumeIsSingleUse(t *testing.T) {
+	store, _ := newStore(t)
+	ctx := context.Background()
+
+	state := nonceState("nonce-1")
+	exp := time.Now().Add(time.Minute).UTC()
+	state.ExpiresAt = &exp
+	if err := store.SaveTokenState(ctx, state, time.Minute); err != nil {
+		t.Fatalf("SaveTokenState(nonce) failed: %v", err)
+	}
+
+	const workers = 12
+	var wg sync.WaitGroup
+	successes := make(chan struct{}, workers)
+	replays := make(chan struct{}, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, ok, err := store.ConsumeTokenState(ctx, "nonce-1")
+			if err != nil || !ok {
+				t.Errorf("ConsumeTokenState ok=%v err=%v", ok, err)
+				return
+			}
+			if !got.IsConsumed() {
+				successes <- struct{}{}
+			} else {
+				replays <- struct{}{}
+			}
+		}()
+	}
+	wg.Wait()
+	close(successes)
+	close(replays)
+	if len(successes) != 1 {
+		t.Fatalf("expected exactly one fresh consume, got %d", len(successes))
+	}
+	if len(replays) != workers-1 {
+		t.Fatalf("expected %d replays, got %d", workers-1, len(replays))
 	}
 }

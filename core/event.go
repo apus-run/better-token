@@ -9,11 +9,17 @@ import (
 type EventType string
 
 const (
-	EventLogin        EventType = "login"
-	EventLogout       EventType = "logout"
-	EventKickOut      EventType = "kick_out"
-	EventRenewTimeout EventType = "renew_timeout"
-	EventReplaced     EventType = "replaced"
+	EventLogin          EventType = "login"
+	EventLogout         EventType = "logout"
+	EventKickOut        EventType = "kick_out"
+	EventRenewTimeout   EventType = "renew_timeout"
+	EventReplaced       EventType = "replaced"
+	EventRefreshIssued  EventType = "refresh_issued"
+	EventRefresh        EventType = "refresh"
+	EventRefreshRevoked EventType = "refresh_revoked"
+	EventNonceConsumed  EventType = "nonce_consumed"
+	EventOnline         EventType = "online"
+	EventOffline        EventType = "offline"
 )
 
 type Event struct {

@@ -2,10 +2,11 @@
 //
 // key 布局（prefix 默认 "bt"）：
 //
-//	{prefix}:token:{token}                        -> TokenState JSON（带 TTL）
-//	{prefix}:index:{login_type}:{login_id}        -> token Set（登录主体 -> token 集合）
-//	{prefix}:session:{login_type}:{login_id}      -> Session JSON（带 TTL）
+//	{prefix}:token:{token}                   -> TokenState JSON（带 TTL，含 kind/status）
+//	{prefix}:index:{login_type}:{login_id}   -> token Set（登录主体 -> 所有 kind 的 token 集合）
+//	{prefix}:session:{login_type}:{login_id} -> Session JSON（带 TTL）
 //
+// access / refresh / nonce 统一以 TokenState 表达，通过 kind 区分，不再有独立命名空间。
 // 索引（Set）是本实现的内部细节：Manager 只通过 LoginSubject 表达语义，
 // 索引的维护、过期成员的清理都由本包负责。
 package redis
@@ -79,11 +80,9 @@ func (s *Store) SaveTokenState(ctx context.Context, state *core.TokenState, ttl 
 	if clone.Token == "" {
 		return core.ErrEmptyToken
 	}
-	if clone.LoginID == "" {
+	clone.Normalize()
+	if clone.LoginID == "" && clone.Kind != core.TokenKindNonce {
 		return core.ErrEmptyLoginID
-	}
-	if clone.LoginType == "" {
-		clone.LoginType = core.DefaultLoginType
 	}
 
 	data, err := json.Marshal(clone)
@@ -108,13 +107,12 @@ func (s *Store) SaveTokenState(ctx context.Context, state *core.TokenState, ttl 
 		pipe.SRem(ctx, s.indexKey(oldSubject), string(clone.Token))
 	}
 	pipe.Set(ctx, tokenKey, data, expiration)
+	pipe.Del(ctx, s.consumedMarkerKey(clone.Token))
 	pipe.SAdd(ctx, indexKey, string(clone.Token))
 	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
 
-	// 索引 Set 的 TTL 仅作 GC 兜底（read 时自愈、empty set 自动删除才是正解），
-	// 失败不影响正确性，故忽略错误。
 	s.refreshIndexTTL(ctx, cli, indexKey, expiration)
 	return nil
 }
@@ -136,12 +134,42 @@ func (s *Store) GetTokenState(ctx context.Context, token core.TokenValue) (*core
 	if err := json.Unmarshal(data, state); err != nil {
 		return nil, false, err
 	}
+	state.Normalize()
 
 	if state.IsExpired(s.now()) {
 		if err := s.deleteToken(ctx, cli, token, state.Subject()); err != nil {
 			return nil, false, err
 		}
 		return nil, false, nil
+	}
+	return state, true, nil
+}
+
+func (s *Store) ConsumeTokenState(ctx context.Context, token core.TokenValue) (*core.TokenState, bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, false, err
+	}
+	result, err := s.rdb.DB(ctx).Eval(ctx, consumeScript, []string{s.tokenKey(token), s.consumedMarkerKey(token)}).Text()
+	if rdb.IsNilError(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	status, raw, ok := cutNewline(result)
+	if status == "missing" || raw == "" {
+		return nil, false, nil
+	}
+	_ = ok
+	state := new(core.TokenState)
+	if err := json.Unmarshal([]byte(raw), state); err != nil {
+		return nil, false, err
+	}
+	state.Normalize()
+	// fresh：本次消费成功，返回消费前（active）快照；
+	// consumed：此前已被消费，快照标记为 consumed 供上层判定重放。
+	if status == "consumed" {
+		state.MarkConsumed(s.now())
 	}
 	return state, true, nil
 }
@@ -161,7 +189,7 @@ func (s *Store) DeleteTokenState(ctx context.Context, token core.TokenValue) err
 	return s.deleteToken(ctx, cli, token, subject)
 }
 
-func (s *Store) FindTokenStates(ctx context.Context, subject core.LoginSubject) ([]*core.TokenState, error) {
+func (s *Store) FindTokenStates(ctx context.Context, subject core.LoginSubject, kinds ...core.TokenKind) ([]*core.TokenState, error) {
 	if err := contextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -199,9 +227,13 @@ func (s *Store) FindTokenStates(ctx context.Context, subject core.LoginSubject) 
 		if err := json.Unmarshal([]byte(raw), state); err != nil {
 			return nil, err
 		}
+		state.Normalize()
 		if state.IsExpired(now) {
 			staleMembers = append(staleMembers, members[i])
 			expiredKeys = append(expiredKeys, keys[i])
+			continue
+		}
+		if !core.MatchKind(state.Kind, kinds...) {
 			continue
 		}
 		result = append(result, state)
@@ -222,7 +254,7 @@ func (s *Store) FindTokenStates(ctx context.Context, subject core.LoginSubject) 
 	return result, nil
 }
 
-func (s *Store) DeleteTokenStates(ctx context.Context, subject core.LoginSubject) error {
+func (s *Store) DeleteTokenStates(ctx context.Context, subject core.LoginSubject, kinds ...core.TokenKind) error {
 	if err := contextErr(ctx); err != nil {
 		return err
 	}
@@ -233,12 +265,48 @@ func (s *Store) DeleteTokenStates(ctx context.Context, subject core.LoginSubject
 	if err != nil {
 		return err
 	}
-
-	pipe := cli.TxPipeline()
-	for _, m := range members {
-		pipe.Del(ctx, s.tokenKey(core.TokenValue(m)))
+	if len(members) == 0 {
+		return nil
 	}
-	pipe.Del(ctx, indexKey)
+
+	// 无 kind 过滤：整体删除该主体下全部 token 与索引。
+	if len(kinds) == 0 {
+		pipe := cli.TxPipeline()
+		for _, m := range members {
+			pipe.Del(ctx, s.tokenKey(core.TokenValue(m)))
+		}
+		pipe.Del(ctx, indexKey)
+		_, err = pipe.Exec(ctx)
+		return err
+	}
+
+	// 有 kind 过滤：读取每个 token 的 kind，仅删除匹配者。
+	keys := make([]string, len(members))
+	for i, m := range members {
+		keys[i] = s.tokenKey(core.TokenValue(m))
+	}
+	values, err := cli.MGet(ctx, keys...).Result()
+	if err != nil {
+		return err
+	}
+	pipe := cli.TxPipeline()
+	for i, v := range values {
+		raw, ok := v.(string)
+		if !ok || raw == "" {
+			pipe.SRem(ctx, indexKey, members[i])
+			continue
+		}
+		state := new(core.TokenState)
+		if err := json.Unmarshal([]byte(raw), state); err != nil {
+			return err
+		}
+		state.Normalize()
+		if !core.MatchKind(state.Kind, kinds...) {
+			continue
+		}
+		pipe.Del(ctx, keys[i])
+		pipe.SRem(ctx, indexKey, members[i])
+	}
 	_, err = pipe.Exec(ctx)
 	return err
 }
@@ -311,6 +379,7 @@ func (s *Store) lookupSubject(ctx context.Context, cli rdb.Cmdable, token core.T
 func (s *Store) deleteToken(ctx context.Context, cli rdb.Cmdable, token core.TokenValue, subject core.LoginSubject) error {
 	pipe := cli.TxPipeline()
 	pipe.Del(ctx, s.tokenKey(token))
+	pipe.Del(ctx, s.consumedMarkerKey(token))
 	pipe.SRem(ctx, s.indexKey(subject), string(token))
 	_, err := pipe.Exec(ctx)
 	return err
@@ -320,16 +389,45 @@ func (s *Store) deleteToken(ctx context.Context, cli rdb.Cmdable, token core.Tok
 // 仅作 GC 兜底：失败不影响正确性，故忽略错误。
 func (s *Store) refreshIndexTTL(ctx context.Context, cli rdb.Cmdable, indexKey string, expiration time.Duration) {
 	if expiration <= 0 {
-		// 存在永不过期的 token，索引也不应过期。
 		_ = cli.Persist(ctx, indexKey).Err()
 		return
 	}
-	// ExpireGT 仅在新 TTL 更长时才延长，避免被短命 token 缩短而误删有效成员。
 	_ = cli.ExpireGT(ctx, indexKey, expiration).Err()
+}
+
+// consumeScript 用独立的 consumed 标记（SETNX）实现原子单次消费，避免对 token JSON
+// 做 cjson 往返（空对象会被 cjson 误编码为数组）。KEYS[1]=token key，KEYS[2]=consumed 标记。
+// 返回 "missing" / "fresh\n<json>" / "consumed\n<json>"。
+const consumeScript = `
+local value = redis.call("GET", KEYS[1])
+if not value then
+	return "missing"
+end
+if redis.call("SETNX", KEYS[2], "1") == 0 then
+	return "consumed\n" .. value
+end
+local ttl = redis.call("PTTL", KEYS[1])
+if ttl and ttl > 0 then
+	redis.call("PEXPIRE", KEYS[2], ttl)
+end
+return "fresh\n" .. value
+`
+
+func cutNewline(s string) (string, string, bool) {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			return s[:i], s[i+1:], true
+		}
+	}
+	return s, "", false
 }
 
 func (s *Store) tokenKey(token core.TokenValue) string {
 	return s.prefix + ":token:" + string(token)
+}
+
+func (s *Store) consumedMarkerKey(token core.TokenValue) string {
+	return s.prefix + ":token:" + string(token) + ":consumed"
 }
 
 func (s *Store) indexKey(subject core.LoginSubject) string {
@@ -345,17 +443,10 @@ func (s *Store) sessionKey(subject core.LoginSubject) string {
 // redisTTL 计算 token key 的物理过期时长，语义对齐 memory.Store：
 // 取 ttl 派生过期时刻与 state.ExpiresAt 中较早者；二者皆无则返回 0（永不过期）。
 func redisTTL(now time.Time, state *core.TokenState, ttl time.Duration) time.Duration {
-	var expiresAt *time.Time
-	if ttl > 0 {
-		exp := now.Add(ttl).UTC()
-		expiresAt = &exp
-	}
-	if state.ExpiresAt != nil {
-		exp := state.ExpiresAt.UTC()
-		if expiresAt == nil || exp.Before(*expiresAt) {
-			expiresAt = &exp
-		}
-	}
+	return redisExpiresTTL(now, state.EffectiveExpiresAt(now, ttl))
+}
+
+func redisExpiresTTL(now time.Time, expiresAt *time.Time) time.Duration {
 	if expiresAt == nil {
 		return 0
 	}

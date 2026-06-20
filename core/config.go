@@ -17,6 +17,8 @@ type Config struct {
 
 	Concurrent bool
 	ShareToken bool
+
+	RequireNonce bool
 }
 
 func DefaultConfig() Config {
@@ -28,5 +30,6 @@ func DefaultConfig() Config {
 		AutoRenew:     false,
 		Concurrent:    true,
 		ShareToken:    false,
+		RequireNonce:  false,
 	}
 }

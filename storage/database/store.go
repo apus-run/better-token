@@ -2,12 +2,14 @@
 //
 // 表结构（建议，由 Migrate 自动建表）：
 //
-//	token_states(token PK, login_id, login_type, device, state_json, expires_at, last_active_at, created_at)
-//	  索引 idx_token_states_login(login_id, login_type)
+//	token_states(token PK, kind, login_id, login_type, status, device, state_json,
+//	             expires_at, last_active_at, created_at)
+//	  索引 idx_token_states_subject(login_id, login_type, kind)
 //	sessions(login_id, login_type 复合主键, data_json, expires_at, created_at)
 //
-// 完整领域对象序列化进 state_json / data_json，其余列用于过滤与索引。
-// 数据库无自动过期能力，过期由 expires_at 列过滤 + 读时惰性物理删除实现。
+// access / refresh / nonce 统一以 TokenState 表达，通过 kind 列区分。完整领域对象
+// 序列化进 state_json，其余列用于过滤、索引与原子消费。数据库无自动过期能力，
+// 过期由 expires_at 列过滤 + 读时惰性物理删除实现。
 package database
 
 import (
@@ -25,12 +27,14 @@ import (
 
 var _ core.Store = (*Store)(nil)
 
-// tokenStateRecord 是 token 状态的持久化行。完整 TokenState 存于 StateJSON，
-// 其余列用于按主体索引与过期过滤。
+// tokenStateRecord 是统一 token 状态的持久化行。完整 TokenState 存于 StateJSON，
+// 其余列用于按主体/kind 索引、过期过滤与原子消费。
 type tokenStateRecord struct {
 	Token        string     `gorm:"column:token;primaryKey;size:255"`
-	LoginID      string     `gorm:"column:login_id;size:255;index:idx_token_states_login,priority:1"`
-	LoginType    string     `gorm:"column:login_type;size:64;index:idx_token_states_login,priority:2"`
+	Kind         string     `gorm:"column:kind;size:32;index:idx_token_states_subject,priority:3"`
+	LoginID      string     `gorm:"column:login_id;size:255;index:idx_token_states_subject,priority:1"`
+	LoginType    string     `gorm:"column:login_type;size:64;index:idx_token_states_subject,priority:2"`
+	Status       string     `gorm:"column:status;size:32;index"`
 	Device       string     `gorm:"column:device;size:255"`
 	StateJSON    []byte     `gorm:"column:state_json;type:text;not null"`
 	ExpiresAt    *time.Time `gorm:"column:expires_at;index"`
@@ -83,7 +87,7 @@ func NewStore(provider db.Provider, opts ...Option) *Store {
 	return s
 }
 
-// Migrate 自动建表，应在使用 Store 前调用一次。
+// Migrate 自动建表，应在使用 Store 前调用一次。对已存在的旧表会补充 kind/status 列。
 func (s *Store) Migrate(ctx context.Context) error {
 	return s.db.DB(ctx).AutoMigrate(&tokenStateRecord{}, &sessionRecord{})
 }
@@ -99,11 +103,9 @@ func (s *Store) SaveTokenState(ctx context.Context, state *core.TokenState, ttl 
 	if clone.Token == "" {
 		return core.ErrEmptyToken
 	}
-	if clone.LoginID == "" {
+	clone.Normalize()
+	if clone.LoginID == "" && clone.Kind != core.TokenKindNonce {
 		return core.ErrEmptyLoginID
-	}
-	if clone.LoginType == "" {
-		clone.LoginType = core.DefaultLoginType
 	}
 
 	data, err := json.Marshal(clone)
@@ -112,11 +114,13 @@ func (s *Store) SaveTokenState(ctx context.Context, state *core.TokenState, ttl 
 	}
 	record := tokenStateRecord{
 		Token:        string(clone.Token),
+		Kind:         string(clone.Kind),
 		LoginID:      clone.LoginID,
 		LoginType:    clone.LoginType,
+		Status:       string(clone.Status),
 		Device:       clone.Device,
 		StateJSON:    data,
-		ExpiresAt:    effectiveExpiry(s.now(), clone, ttl),
+		ExpiresAt:    clone.EffectiveExpiresAt(s.now(), ttl),
 		LastActiveAt: clone.LastActiveAt,
 		CreatedAt:    clone.CreatedAt,
 	}
@@ -146,8 +150,7 @@ func (s *Store) GetTokenState(ctx context.Context, token core.TokenValue) (*core
 		return nil, false, err
 	}
 
-	// 过期判定依据落库的 expires_at 列（已编码 ttl 与 state.ExpiresAt 中较早者），
-	// 而非 state JSON 内可能为空的 ExpiresAt 字段。
+	// 过期判定依据落库的 expires_at 列（已编码 ttl 与 state.ExpiresAt 中较早者）。
 	if record.ExpiresAt != nil && !s.now().UTC().Before(record.ExpiresAt.UTC()) {
 		if err := s.db.DB(ctx).Where("token = ?", string(token)).Delete(&tokenStateRecord{}).Error; err != nil {
 			return nil, false, err
@@ -157,6 +160,62 @@ func (s *Store) GetTokenState(ctx context.Context, token core.TokenValue) (*core
 	return state, true, nil
 }
 
+func (s *Store) ConsumeTokenState(ctx context.Context, token core.TokenValue) (*core.TokenState, bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, false, err
+	}
+
+	var (
+		state *core.TokenState
+		found bool
+	)
+	err := s.db.DB(ctx).Transaction(func(tx *gorm.DB) error {
+		var record tokenStateRecord
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("token = ?", string(token)).
+			First(&record).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		decoded, err := decodeTokenState(record.StateJSON)
+		if err != nil {
+			return err
+		}
+
+		now := s.now().UTC()
+		expired := record.ExpiresAt != nil && !now.Before(record.ExpiresAt.UTC())
+		if expired {
+			// 过期等同不存在：物理删除并返回 found=false。
+			return tx.Where("token = ?", string(token)).Delete(&tokenStateRecord{}).Error
+		}
+
+		found = true
+		// 返回消费前快照。
+		state = decoded.Clone()
+		if !decoded.IsActive(now) {
+			return nil
+		}
+
+		consumed := decoded.Clone()
+		consumed.MarkConsumed(now)
+		data, err := json.Marshal(consumed)
+		if err != nil {
+			return err
+		}
+		result := tx.Model(&tokenStateRecord{}).
+			Where("token = ? AND status = ?", string(token), string(core.TokenStatusActive)).
+			Updates(map[string]any{"status": string(core.TokenStatusConsumed), "state_json": data})
+		return result.Error
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return state, found, nil
+}
+
 func (s *Store) DeleteTokenState(ctx context.Context, token core.TokenValue) error {
 	if err := contextErr(ctx); err != nil {
 		return err
@@ -164,7 +223,7 @@ func (s *Store) DeleteTokenState(ctx context.Context, token core.TokenValue) err
 	return s.db.DB(ctx).Where("token = ?", string(token)).Delete(&tokenStateRecord{}).Error
 }
 
-func (s *Store) FindTokenStates(ctx context.Context, subject core.LoginSubject) ([]*core.TokenState, error) {
+func (s *Store) FindTokenStates(ctx context.Context, subject core.LoginSubject, kinds ...core.TokenKind) ([]*core.TokenState, error) {
 	if err := contextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -178,10 +237,13 @@ func (s *Store) FindTokenStates(ctx context.Context, subject core.LoginSubject) 
 		return nil, err
 	}
 
+	query := s.db.DB(ctx).Where("login_id = ? AND login_type = ?", key.LoginID, key.LoginType)
+	if kindStrings := kindsToStrings(kinds); len(kindStrings) > 0 {
+		query = query.Where("kind IN ?", kindStrings)
+	}
+
 	var records []tokenStateRecord
-	if err := s.db.DB(ctx).
-		Where("login_id = ? AND login_type = ?", key.LoginID, key.LoginType).
-		Find(&records).Error; err != nil {
+	if err := query.Find(&records).Error; err != nil {
 		return nil, err
 	}
 
@@ -196,14 +258,16 @@ func (s *Store) FindTokenStates(ctx context.Context, subject core.LoginSubject) 
 	return result, nil
 }
 
-func (s *Store) DeleteTokenStates(ctx context.Context, subject core.LoginSubject) error {
+func (s *Store) DeleteTokenStates(ctx context.Context, subject core.LoginSubject, kinds ...core.TokenKind) error {
 	if err := contextErr(ctx); err != nil {
 		return err
 	}
 	key := subject.Normalize()
-	return s.db.DB(ctx).
-		Where("login_id = ? AND login_type = ?", key.LoginID, key.LoginType).
-		Delete(&tokenStateRecord{}).Error
+	query := s.db.DB(ctx).Where("login_id = ? AND login_type = ?", key.LoginID, key.LoginType)
+	if kindStrings := kindsToStrings(kinds); len(kindStrings) > 0 {
+		query = query.Where("kind IN ?", kindStrings)
+	}
+	return query.Delete(&tokenStateRecord{}).Error
 }
 
 func (s *Store) SaveSession(ctx context.Context, session *core.Session, ttl time.Duration) error {
@@ -288,24 +352,19 @@ func decodeTokenState(data []byte) (*core.TokenState, error) {
 	if err := json.Unmarshal(data, state); err != nil {
 		return nil, err
 	}
+	state.Normalize()
 	return state, nil
 }
 
-// effectiveExpiry 计算落库的过期时刻，语义对齐 memory.Store：
-// 取 ttl 派生过期时刻与 state.ExpiresAt 中较早者；二者皆无则返回 nil（永不过期）。
-func effectiveExpiry(now time.Time, state *core.TokenState, ttl time.Duration) *time.Time {
-	var expiresAt *time.Time
-	if ttl > 0 {
-		exp := now.Add(ttl).UTC()
-		expiresAt = &exp
+func kindsToStrings(kinds []core.TokenKind) []string {
+	if len(kinds) == 0 {
+		return nil
 	}
-	if state.ExpiresAt != nil {
-		exp := state.ExpiresAt.UTC()
-		if expiresAt == nil || exp.Before(*expiresAt) {
-			expiresAt = &exp
-		}
+	result := make([]string, 0, len(kinds))
+	for _, k := range kinds {
+		result = append(result, string(k))
 	}
-	return expiresAt
+	return result
 }
 
 func contextErr(ctx context.Context) error {

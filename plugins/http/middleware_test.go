@@ -106,3 +106,46 @@ func TestTokenGeneratorIntegrationWithHTTPMiddleware(t *testing.T) {
 		t.Fatalf("status = %d", res.Code)
 	}
 }
+
+func TestMiddlewareAcceptsRefreshedAccessToken(t *testing.T) {
+	store := memory.NewStore()
+	manager := core.NewManager(store, core.WithConfig(core.Config{
+		TokenName:   "Authorization",
+		TokenPrefix: "Bearer",
+		Timeout:     time.Hour,
+		Concurrent:  true,
+	}))
+	if _, err := manager.LoginWithRefresh(context.Background(), "1001", "access-1", "refresh-1"); err != nil {
+		t.Fatalf("LoginWithRefresh failed: %v", err)
+	}
+	if _, err := manager.Refresh(context.Background(), "refresh-1", "access-2", core.WithNextRefreshToken("refresh-2")); err != nil {
+		t.Fatalf("Refresh failed: %v", err)
+	}
+
+	handler := Middleware(manager)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		loginID, err := core.RequireLoginID(r.Context())
+		if err != nil {
+			t.Fatalf("RequireLoginID failed: %v", err)
+		}
+		if loginID != "1001" {
+			t.Fatalf("loginID = %q", loginID)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	oldReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	oldReq.Header.Set("Authorization", "Bearer access-1")
+	oldRes := httptest.NewRecorder()
+	handler.ServeHTTP(oldRes, oldReq)
+	if oldRes.Code != http.StatusUnauthorized {
+		t.Fatalf("old access token status = %d", oldRes.Code)
+	}
+
+	newReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	newReq.Header.Set("Authorization", "Bearer access-2")
+	newRes := httptest.NewRecorder()
+	handler.ServeHTTP(newRes, newReq)
+	if newRes.Code != http.StatusOK {
+		t.Fatalf("new access token status = %d", newRes.Code)
+	}
+}
