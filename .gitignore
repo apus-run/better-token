@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go 构建产物
+*.test
+*.out
+*.exe
+/bin/
+/dist/
+
+# 覆盖率
+coverage.txt
+coverage.html
+
+# 临时文件
+*.tmp
+*.log

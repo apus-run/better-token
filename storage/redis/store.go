@@ -1,0 +1,375 @@
+// Package redis 基于 github.com/apus-run/gala/components/rdb 实现 core.Store。
+//
+// key 布局（prefix 默认 "bt"）：
+//
+//	{prefix}:token:{token}                        -> TokenState JSON（带 TTL）
+//	{prefix}:index:{login_type}:{login_id}        -> token Set（登录主体 -> token 集合）
+//	{prefix}:session:{login_type}:{login_id}      -> Session JSON（带 TTL）
+//
+// 索引（Set）是本实现的内部细节：Manager 只通过 LoginSubject 表达语义，
+// 索引的维护、过期成员的清理都由本包负责。
+package redis
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/apus-run/better-token/core"
+	"github.com/apus-run/better-token/pkg/option"
+	"github.com/apus-run/gala/components/rdb"
+)
+
+var _ core.Store = (*Store)(nil)
+
+// DefaultKeyPrefix 是所有 key 的默认前缀，避免与共享同一 Redis 的其它应用冲突。
+const DefaultKeyPrefix = "bt"
+
+// Store 是 core.Store 的 Redis 实现，依赖 rdb.Provider 提供 redis 客户端。
+type Store struct {
+	rdb    rdb.Provider
+	prefix string
+	now    core.NowFunc
+}
+
+// Option 定制 Redis Store 的构造行为。
+type Option = option.Option[Store]
+
+// WithKeyPrefix 覆盖默认 key 前缀。空字符串将被忽略，保持默认前缀。
+func WithKeyPrefix(prefix string) Option {
+	return func(s *Store) {
+		if prefix != "" {
+			s.prefix = prefix
+		}
+	}
+}
+
+// WithRuntime 注入运行时（主要是自定义时钟），用于测试中冻结时间。
+// runtime.Now 为 nil 时保持默认时钟不变。
+func WithRuntime(runtime core.Runtime) Option {
+	return func(s *Store) {
+		if runtime.Now != nil {
+			s.now = runtime.Now
+		}
+	}
+}
+
+// NewStore 基于 rdb.Provider 构造 Redis Store。provider 为 nil 时返回 nil。
+func NewStore(provider rdb.Provider, opts ...Option) *Store {
+	if provider == nil {
+		return nil
+	}
+	s := &Store{
+		rdb:    provider,
+		prefix: DefaultKeyPrefix,
+		now:    core.DefaultRuntime().Now,
+	}
+	option.Apply(s, opts...)
+	return s
+}
+
+func (s *Store) SaveTokenState(ctx context.Context, state *core.TokenState, ttl time.Duration) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	if state == nil {
+		return core.ErrEmptyToken
+	}
+	clone := state.Clone()
+	if clone.Token == "" {
+		return core.ErrEmptyToken
+	}
+	if clone.LoginID == "" {
+		return core.ErrEmptyLoginID
+	}
+	if clone.LoginType == "" {
+		clone.LoginType = core.DefaultLoginType
+	}
+
+	data, err := json.Marshal(clone)
+	if err != nil {
+		return err
+	}
+	expiration := redisTTL(s.now(), clone, ttl)
+	subject := clone.Subject()
+	tokenKey := s.tokenKey(clone.Token)
+	indexKey := s.indexKey(subject)
+
+	cli := s.rdb.DB(ctx)
+
+	// 处理主体重绑定：同一 token 改归属时，需从旧主体索引中移除。
+	oldSubject, found, err := s.lookupSubject(ctx, cli, clone.Token)
+	if err != nil {
+		return err
+	}
+
+	pipe := cli.TxPipeline()
+	if found && oldSubject != subject.Normalize() {
+		pipe.SRem(ctx, s.indexKey(oldSubject), string(clone.Token))
+	}
+	pipe.Set(ctx, tokenKey, data, expiration)
+	pipe.SAdd(ctx, indexKey, string(clone.Token))
+	if _, err := pipe.Exec(ctx); err != nil {
+		return err
+	}
+
+	// 索引 Set 的 TTL 仅作 GC 兜底（read 时自愈、empty set 自动删除才是正解），
+	// 失败不影响正确性，故忽略错误。
+	s.refreshIndexTTL(ctx, cli, indexKey, expiration)
+	return nil
+}
+
+func (s *Store) GetTokenState(ctx context.Context, token core.TokenValue) (*core.TokenState, bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, false, err
+	}
+	cli := s.rdb.DB(ctx)
+	data, err := cli.Get(ctx, s.tokenKey(token)).Bytes()
+	if rdb.IsNilError(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+
+	state := new(core.TokenState)
+	if err := json.Unmarshal(data, state); err != nil {
+		return nil, false, err
+	}
+
+	if state.IsExpired(s.now()) {
+		if err := s.deleteToken(ctx, cli, token, state.Subject()); err != nil {
+			return nil, false, err
+		}
+		return nil, false, nil
+	}
+	return state, true, nil
+}
+
+func (s *Store) DeleteTokenState(ctx context.Context, token core.TokenValue) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	cli := s.rdb.DB(ctx)
+	subject, found, err := s.lookupSubject(ctx, cli, token)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil // 幂等：不存在直接返回
+	}
+	return s.deleteToken(ctx, cli, token, subject)
+}
+
+func (s *Store) FindTokenStates(ctx context.Context, subject core.LoginSubject) ([]*core.TokenState, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
+	cli := s.rdb.DB(ctx)
+	indexKey := s.indexKey(subject)
+
+	members, err := cli.SMembers(ctx, indexKey).Result()
+	if err != nil {
+		return nil, err
+	}
+	if len(members) == 0 {
+		return nil, nil
+	}
+
+	keys := make([]string, len(members))
+	for i, m := range members {
+		keys[i] = s.tokenKey(core.TokenValue(m))
+	}
+	values, err := cli.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	now := s.now()
+	result := make([]*core.TokenState, 0, len(members))
+	var staleMembers []any   // 索引中需移除的 token（物理已不存在）
+	var expiredKeys []string // 仍物理存在但已逻辑过期的 token key，需物理删除
+	for i, v := range values {
+		raw, ok := v.(string)
+		if !ok || raw == "" {
+			staleMembers = append(staleMembers, members[i])
+			continue
+		}
+		state := new(core.TokenState)
+		if err := json.Unmarshal([]byte(raw), state); err != nil {
+			return nil, err
+		}
+		if state.IsExpired(now) {
+			staleMembers = append(staleMembers, members[i])
+			expiredKeys = append(expiredKeys, keys[i])
+			continue
+		}
+		result = append(result, state)
+	}
+
+	if len(staleMembers) > 0 || len(expiredKeys) > 0 {
+		pipe := cli.TxPipeline()
+		if len(staleMembers) > 0 {
+			pipe.SRem(ctx, indexKey, staleMembers...)
+		}
+		if len(expiredKeys) > 0 {
+			pipe.Del(ctx, expiredKeys...)
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func (s *Store) DeleteTokenStates(ctx context.Context, subject core.LoginSubject) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	cli := s.rdb.DB(ctx)
+	indexKey := s.indexKey(subject)
+
+	members, err := cli.SMembers(ctx, indexKey).Result()
+	if err != nil {
+		return err
+	}
+
+	pipe := cli.TxPipeline()
+	for _, m := range members {
+		pipe.Del(ctx, s.tokenKey(core.TokenValue(m)))
+	}
+	pipe.Del(ctx, indexKey)
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+func (s *Store) SaveSession(ctx context.Context, session *core.Session, ttl time.Duration) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	if session == nil {
+		return core.ErrEmptySessionID
+	}
+	subject := session.Subject.Normalize()
+	if subject.IsZero() {
+		return core.ErrEmptySessionID
+	}
+
+	data, err := json.Marshal(session.Clone())
+	if err != nil {
+		return err
+	}
+	var expiration time.Duration
+	if ttl > 0 {
+		expiration = ttl
+	}
+	return s.rdb.DB(ctx).Set(ctx, s.sessionKey(subject), data, expiration).Err()
+}
+
+func (s *Store) GetSession(ctx context.Context, subject core.LoginSubject) (*core.Session, bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, false, err
+	}
+	data, err := s.rdb.DB(ctx).Get(ctx, s.sessionKey(subject.Normalize())).Bytes()
+	if rdb.IsNilError(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	session := new(core.Session)
+	if err := json.Unmarshal(data, session); err != nil {
+		return nil, false, err
+	}
+	return session, true, nil
+}
+
+func (s *Store) DeleteSession(ctx context.Context, subject core.LoginSubject) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	return s.rdb.DB(ctx).Del(ctx, s.sessionKey(subject.Normalize())).Err()
+}
+
+// lookupSubject 读取 token 当前归属的登录主体，用于索引维护。
+func (s *Store) lookupSubject(ctx context.Context, cli rdb.Cmdable, token core.TokenValue) (core.LoginSubject, bool, error) {
+	data, err := cli.Get(ctx, s.tokenKey(token)).Bytes()
+	if rdb.IsNilError(err) {
+		return core.LoginSubject{}, false, nil
+	}
+	if err != nil {
+		return core.LoginSubject{}, false, err
+	}
+	state := new(core.TokenState)
+	if err := json.Unmarshal(data, state); err != nil {
+		return core.LoginSubject{}, false, err
+	}
+	return state.Subject().Normalize(), true, nil
+}
+
+// deleteToken 删除 token 并清理其在登录主体索引中的成员。
+func (s *Store) deleteToken(ctx context.Context, cli rdb.Cmdable, token core.TokenValue, subject core.LoginSubject) error {
+	pipe := cli.TxPipeline()
+	pipe.Del(ctx, s.tokenKey(token))
+	pipe.SRem(ctx, s.indexKey(subject), string(token))
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// refreshIndexTTL 将索引 Set 的 TTL 维持到不短于当前 token 的存活期。
+// 仅作 GC 兜底：失败不影响正确性，故忽略错误。
+func (s *Store) refreshIndexTTL(ctx context.Context, cli rdb.Cmdable, indexKey string, expiration time.Duration) {
+	if expiration <= 0 {
+		// 存在永不过期的 token，索引也不应过期。
+		_ = cli.Persist(ctx, indexKey).Err()
+		return
+	}
+	// ExpireGT 仅在新 TTL 更长时才延长，避免被短命 token 缩短而误删有效成员。
+	_ = cli.ExpireGT(ctx, indexKey, expiration).Err()
+}
+
+func (s *Store) tokenKey(token core.TokenValue) string {
+	return s.prefix + ":token:" + string(token)
+}
+
+func (s *Store) indexKey(subject core.LoginSubject) string {
+	n := subject.Normalize()
+	return s.prefix + ":index:" + n.LoginType + ":" + n.LoginID
+}
+
+func (s *Store) sessionKey(subject core.LoginSubject) string {
+	n := subject.Normalize()
+	return s.prefix + ":session:" + n.LoginType + ":" + n.LoginID
+}
+
+// redisTTL 计算 token key 的物理过期时长，语义对齐 memory.Store：
+// 取 ttl 派生过期时刻与 state.ExpiresAt 中较早者；二者皆无则返回 0（永不过期）。
+func redisTTL(now time.Time, state *core.TokenState, ttl time.Duration) time.Duration {
+	var expiresAt *time.Time
+	if ttl > 0 {
+		exp := now.Add(ttl).UTC()
+		expiresAt = &exp
+	}
+	if state.ExpiresAt != nil {
+		exp := state.ExpiresAt.UTC()
+		if expiresAt == nil || exp.Before(*expiresAt) {
+			expiresAt = &exp
+		}
+	}
+	if expiresAt == nil {
+		return 0
+	}
+	d := expiresAt.Sub(now)
+	if d <= 0 {
+		// 已过期：用极短 TTL 让其尽快物理消失，而非误持久化。
+		return time.Millisecond
+	}
+	return d
+}
+
+func contextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
+}
