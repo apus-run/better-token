@@ -355,3 +355,37 @@ func TestStoreNonceConsumeIsSingleUse(t *testing.T) {
 		t.Fatalf("expected %d replays, got %d", workers-1, len(replays))
 	}
 }
+
+func TestStoreRedisTTLEvictsAccessAndRefresh(t *testing.T) {
+	store, mr := newStore(t)
+	ctx := context.Background()
+
+	if err := store.SaveTokenState(ctx, tokenState("t1", "1001", "login"), time.Minute); err != nil {
+		t.Fatalf("SaveTokenState(access) failed: %v", err)
+	}
+	if err := store.SaveTokenState(ctx, refreshState("r1", "1001", "login"), time.Minute); err != nil {
+		t.Fatalf("SaveTokenState(refresh) failed: %v", err)
+	}
+	mr.FastForward(2 * time.Minute)
+
+	if _, ok, _ := store.GetTokenState(ctx, "t1"); ok {
+		t.Fatal("expired access token should be evicted by Redis TTL")
+	}
+	if _, ok, _ := store.GetTokenState(ctx, "r1"); ok {
+		t.Fatal("expired refresh token should be evicted by Redis TTL")
+	}
+}
+
+func TestStoreRedisSessionTTL(t *testing.T) {
+	store, mr := newStore(t)
+	ctx := context.Background()
+	subject := core.LoginSubject{LoginID: "1001"}.Normalize()
+
+	if err := store.SaveSession(ctx, core.NewSessionForSubject(subject), time.Minute); err != nil {
+		t.Fatalf("SaveSession failed: %v", err)
+	}
+	mr.FastForward(2 * time.Minute)
+	if _, ok, _ := store.GetSession(ctx, subject); ok {
+		t.Fatal("expired session should be evicted by Redis TTL")
+	}
+}

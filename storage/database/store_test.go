@@ -397,3 +397,29 @@ func TestStoreNonceConsumeEvictsExpiredRow(t *testing.T) {
 		t.Fatalf("expired nonce row should be evicted, ok=%v err=%v", ok, err)
 	}
 }
+
+func TestStoreDeleteTokenStatesByKindKeepsOtherKinds(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+	subject := core.LoginSubject{LoginID: "1001", LoginType: "login"}.Normalize()
+
+	if err := store.SaveTokenState(ctx, tokenState("a1", "1001", "login"), time.Hour); err != nil {
+		t.Fatalf("SaveTokenState(access) failed: %v", err)
+	}
+	r := refreshState("r1", "1001", "login")
+	if err := store.SaveTokenState(ctx, r, time.Hour); err != nil {
+		t.Fatalf("SaveTokenState(refresh) failed: %v", err)
+	}
+
+	if err := store.DeleteTokenStates(ctx, subject, core.TokenKindRefresh); err != nil {
+		t.Fatalf("DeleteTokenStates(refresh) failed: %v", err)
+	}
+	access, _ := store.FindTokenStates(ctx, subject, core.TokenKindAccess)
+	if len(access) != 1 {
+		t.Fatalf("access token should survive refresh-only delete, got %d", len(access))
+	}
+	refresh, _ := store.FindTokenStates(ctx, subject, core.TokenKindRefresh)
+	if len(refresh) != 0 {
+		t.Fatalf("refresh token should be deleted, got %d", len(refresh))
+	}
+}
