@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/apus-run/better-token/core"
+	"github.com/apus-run/better-token/plugins"
 )
 
 func Middleware(manager *core.Manager, opts ...Option) func(http.Handler) http.Handler {
@@ -25,12 +26,12 @@ func Middleware(manager *core.Manager, opts ...Option) func(http.Handler) http.H
 				unauthorized(w, r)
 				return
 			}
-			state, err := manager.GetTokenState(r.Context(), token)
+			auth, err := plugins.Authenticate(r.Context(), manager, token)
 			if err != nil {
 				unauthorized(w, r)
 				return
 			}
-			ctx := core.WithAuth(r.Context(), core.NewAuthContext(state))
+			ctx := core.WithAuth(r.Context(), auth)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

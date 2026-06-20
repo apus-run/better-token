@@ -4,6 +4,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/apus-run/better-token/core"
+	"github.com/apus-run/better-token/plugins"
 	httpplugin "github.com/apus-run/better-token/plugins/http"
 )
 
@@ -35,13 +36,12 @@ func Middleware(manager *core.Manager, opts ...Option) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		state, err := manager.GetTokenState(c.Request.Context(), token)
+		auth, err := plugins.Authenticate(c.Request.Context(), manager, token)
 		if err != nil {
 			unauthorized(c.Writer, c.Request)
 			c.Abort()
 			return
 		}
-		auth := core.NewAuthContext(state)
 		c.Request = c.Request.WithContext(core.WithAuth(c.Request.Context(), auth))
 		c.Set("auth", auth)
 		c.Next()

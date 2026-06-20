@@ -2,21 +2,22 @@ package http
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/apus-run/better-token/core"
 	"github.com/apus-run/better-token/pkg/option"
+	"github.com/apus-run/better-token/plugins"
 )
 
 type Extractor struct {
-	opts options
+	opts   options
+	lookup plugins.TokenLookup
 }
 
 func NewExtractor(opts ...Option) Extractor {
 	extractor := Extractor{
 		opts: options{
 			tokenName:        core.DefaultTokenName,
-			authorizationKey: "Authorization",
+			authorizationKey: plugins.DefaultAuthorizationKey,
 		},
 	}
 	option.Apply(&extractor.opts, opts...)
@@ -24,7 +25,12 @@ func NewExtractor(opts ...Option) Extractor {
 		extractor.opts.tokenName = core.DefaultTokenName
 	}
 	if extractor.opts.authorizationKey == "" {
-		extractor.opts.authorizationKey = "Authorization"
+		extractor.opts.authorizationKey = plugins.DefaultAuthorizationKey
+	}
+	extractor.lookup = plugins.TokenLookup{
+		TokenName:        extractor.opts.tokenName,
+		TokenPrefix:      extractor.opts.tokenPrefix,
+		AuthorizationKey: extractor.opts.authorizationKey,
 	}
 	return extractor
 }
@@ -42,23 +48,16 @@ func (e Extractor) ExtractToken(r *http.Request) (core.TokenValue, bool) {
 	if r == nil {
 		return "", false
 	}
-
-	if token, ok := e.normalize(r.Header.Get(e.opts.tokenName)); ok {
-		return token, true
-	}
-	if token, ok := e.normalize(r.Header.Get(e.opts.authorizationKey)); ok {
-		return token, true
-	}
-	if cookie, err := r.Cookie(e.opts.tokenName); err == nil {
-		if token, ok := e.normalize(cookie.Value); ok {
-			return token, true
-		}
-	}
-	if token, ok := e.normalize(r.URL.Query().Get(e.opts.tokenName)); ok {
-		return token, true
-	}
-
-	return "", false
+	return e.lookup.Resolve(plugins.Getters{
+		Header: r.Header.Get,
+		Cookie: func(key string) string {
+			if cookie, err := r.Cookie(key); err == nil {
+				return cookie.Value
+			}
+			return ""
+		},
+		Query: r.URL.Query().Get,
+	})
 }
 
 func (e Extractor) Unauthorized() func(http.ResponseWriter, *http.Request) {
@@ -68,28 +67,4 @@ func (e Extractor) Unauthorized() func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	}
-}
-
-func (e Extractor) normalize(value string) (core.TokenValue, bool) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "", false
-	}
-
-	prefix := strings.TrimSpace(e.opts.tokenPrefix)
-	if prefix != "" {
-		fields := strings.Fields(value)
-		if len(fields) == 1 && strings.EqualFold(fields[0], prefix) {
-			return "", false
-		}
-		if len(fields) >= 2 && strings.EqualFold(fields[0], prefix) {
-			value = strings.TrimSpace(strings.TrimPrefix(value, fields[0]))
-		}
-	}
-
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "", false
-	}
-	return core.TokenValue(value), true
 }
