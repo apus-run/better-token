@@ -274,6 +274,7 @@ router.GET("/me", func(c *gin.Context) {
 
 更多完整示例：
 
+- [`examples/admin`](examples/admin)：Gin + HTMX + SQLite 后台，完整串联 nonce、access/refresh、Gin middleware、RBAC、Session、在线设备、踢下线和异步审计；token store 可切换 memory/SQLite。
 - `examples/basic`
 - `examples/refresh-token`
 - `examples/nonce`

@@ -1,0 +1,37 @@
+{{define "scenarios"}}<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Scenarios · better-token</title><script src="https://unpkg.com/htmx.org@2.0.8/dist/htmx.min.js"></script><style>{{template "style"}}</style></head>
+<body><header class="top"><div><h1>场景实验室</h1><small>登录主体 {{.Auth.LoginID}} · 设备 {{.Auth.Device}}</small></div><div class="row">
+<a class="navlink" href="/admin/dashboard.html">Dashboard</a>
+<form method="post" action="/admin/logout" hx-post="/admin/logout" hx-swap="none"><button class="danger">退出当前设备</button></form></div></header>
+<main class="layout">{{if .Message}}<div class="alert success">{{.Message}}</div>{{end}}{{if .Error}}<div class="alert error">{{.Error}}</div>{{end}}
+<section class="grid"><article class="card"><h2>模拟设备登录</h2><form method="post" action="/admin/scenarios/device" hx-post="/admin/scenarios/device" hx-swap="none">
+{{if .CanManageUsers}}<label>用户<select name="login_id">{{range .Users}}<option value="{{.LoginID}}">{{.User.Username}} · {{.User.Role}}</option>{{end}}</select></label>{{else}}<input type="hidden" name="login_id" value="{{.Auth.LoginID}}">{{end}}
+<label>Token 风格<select name="style"><option value="uuid">uuid</option><option value="simple">simple</option><option value="timestamp">timestamp</option><option value="hash">hash</option><option value="tiktok">tiktok</option></select></label>
+<label>设备名<input name="device" value="mobile-safari" required></label><button>创建模拟设备</button></form></article>
+<article class="card"><h2>按设备踢下线</h2><form method="post" action="/admin/scenarios/kick-device" hx-post="/admin/scenarios/kick-device" hx-swap="none">
+{{if .CanManageUsers}}<label>用户<select name="login_id">{{range .Users}}<option value="{{.LoginID}}">{{.User.Username}} · {{.User.Role}}</option>{{end}}</select></label>{{else}}<input type="hidden" name="login_id" value="{{.Auth.LoginID}}">{{end}}
+<label>设备名<input name="device" value="mobile-safari" required></label><button class="danger">踢下线</button></form></article>
+{{if .CanManageUsers}}<article class="card"><h2>全端清理</h2><form method="post" action="/admin/scenarios/logout-user" hx-post="/admin/scenarios/logout-user" hx-swap="none"><label>用户<select name="login_id">{{range .Users}}<option value="{{.LoginID}}">{{.User.Username}} · {{.User.Role}}</option>{{end}}</select></label><button class="danger">清空用户设备</button></form></article>{{end}}
+<article class="card wide"><h2>Token 创建与使用场景</h2><table><thead><tr><th>风格</th><th>生成样例</th><th>长度</th><th>形态</th><th>真实用法</th></tr></thead><tbody>
+{{range .TokenStyles}}<tr><td><span class="pill">{{.Style}}</span><br><small>{{.Label}}</small></td><td class="token"><span>{{.Sample}}</span><button class="icon-btn copy-btn" type="button" title="复制 Token" aria-label="复制 Token" data-copy-token="{{.Sample}}">⧉</button></td><td>{{.Length}}</td><td>{{.Pattern}}</td><td>{{.Usage}}</td></tr>{{end}}
+</tbody></table><p class="muted">上方“模拟设备登录”会把所选风格同时用于 access token 和 refresh token；登录仍通过 nonce 防重放，最终是否有效由 core.Store 中的 TokenState 决定。</p></article>
+<article class="card wide"><h2>JWT 自定义数据解析</h2><p class="muted">JWT Token 支持在 payload 中嵌入自定义业务数据（如 user_id、track_id、role、device 等），通过 <code>jwtManager.ParseToken()</code> 即可提取并在业务逻辑中使用。</p>
+<div class="jwt-demo"><div class="jwt-token"><strong>生成的 JWT Token:</strong><br><div class="token-block" title="点击复制完整 Token" data-copy-token="{{.JwtCustomData.Token}}"><code>{{.JwtCustomData.TokenPreview}}</code><button class="icon-btn copy-btn" type="button" data-copy-token="{{.JwtCustomData.Token}}">⧉</button></div></div>
+<div class="jwt-payload"><strong>解析出的业务数据:</strong><table class="kv-table"><tr><th>字段</th><th>值</th><th>用途说明</th></tr>
+<tr><td><code>data.user_id</code></td><td>{{.JwtCustomData.UserID}}</td><td>查询用户信息、数据隔离、关联业务表</td></tr>
+<tr><td><code>data.track_id</code></td><td>{{.JwtCustomData.TrackID}}</td><td>日志链路追踪、分布式系统问题定位</td></tr>
+<tr><td><code>data.role</code></td><td>{{.JwtCustomData.Role}}</td><td>权限判断、接口访问控制、角色校验</td></tr>
+<tr><td><code>data.device</code></td><td>{{.JwtCustomData.Device}}</td><td>多设备管理、异地登录预警、安全风控</td></tr>
+<tr><td><code>data.ver</code></td><td>{{.JwtCustomData.Version}}</td><td>Token 版本兼容、旧版本强制失效、平滑升级</td></tr>
+<tr><td><code>exp</code> (过期)</td><td>{{.JwtCustomData.ExpiresAt}}</td><td>Token 有效期校验、自动续期判断</td></tr>
+<tr><td><code>iat</code> (签发)</td><td>{{.JwtCustomData.IssuedAt}}</td><td>Token 新鲜度校验、密码修改后失效</td></tr>
+</table></div></div>
+<p class="muted"><strong>使用方式:</strong> <code>claims, _ := jwtManager.ParseToken(tokenString)</code> 后，通过 <code>claims.Data.UserID</code> 即可访问自定义字段。</p></article>
+<article class="card wide"><h2>角色与权限矩阵</h2><table><thead><tr><th>用户</th><th>角色</th><th>权限检查</th><th>已授予</th><th>Session</th></tr></thead><tbody>
+{{range .Users}}<tr><td>{{.User.Username}}<br><small>ID {{.LoginID}}</small></td><td><span class="pill">{{.User.Role}}</span></td><td>{{range .Checks}}<div class="checkline"><span>{{.Label}}</span><span class="{{if .Allowed}}ok{{else}}no{{end}}">{{if .Allowed}}允许{{else}}拒绝{{end}}</span><small>{{.Authority.Type}}:{{.Authority.Value}} · {{.Expected}}</small></div>{{end}}</td><td>{{range .Authorities}}<span class="pill">{{.Type}}:{{.Value}}</span>{{else}}-{{end}}</td><td>主题 {{session .Session "theme"}}<br><small>{{session .Session "note"}}</small></td></tr>{{end}}
+</tbody></table></article>
+<article class="card wide"><h2>多设备登录态</h2><table><thead><tr><th>用户</th><th>Token</th><th>设备</th><th>在线</th><th>最后活跃</th><th>过期</th></tr></thead><tbody>
+{{range .Users}}{{ $user := .User.Username }}{{range .States}}<tr><td>{{$user}}</td><td class="token"><span>{{short .Token}}</span><button class="icon-btn copy-btn" type="button" title="复制 Token" aria-label="复制 Token" data-copy-token="{{.Token}}">⧉</button></td><td>{{.Device}}</td><td>{{if .Online}}{{.Online.ConnectionID}}<br><small>{{.Online.IP}}</small>{{else}}-{{end}}</td><td>{{timefmt .LastActiveAt}}</td><td>{{ptrtime .ExpiresAt}}</td></tr>{{else}}<tr><td>{{$user}}</td><td colspan="5">无有效 access token</td></tr>{{end}}{{end}}
+</tbody></table></article>
+</section></main>{{template "copy_script"}}</body></html>{{end}}
