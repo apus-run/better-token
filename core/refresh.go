@@ -87,7 +87,7 @@ func (m *Manager) LoginWithRefresh(ctx context.Context, loginID string, accessTo
 	}
 
 	refreshState := m.newRefreshState(refreshToken, state)
-	if err := m.store.SaveTokenState(ctx, refreshState, m.refreshTTL(m.now(), refreshState)); err != nil {
+	if err := m.store.SaveTokenState(ctx, refreshState, m.remainingTTL(m.now(), refreshState)); err != nil {
 		_ = m.Logout(ctx, state.Token)
 		return nil, err
 	}
@@ -205,7 +205,7 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 		state.Touch(now)
 		nextRefreshState = state
 	}
-	if err := m.store.SaveTokenState(ctx, nextRefreshState, m.refreshTTL(now, nextRefreshState)); err != nil {
+	if err := m.store.SaveTokenState(ctx, nextRefreshState, m.remainingTTL(now, nextRefreshState)); err != nil {
 		_ = m.Logout(ctx, tokenState.Token)
 		return nil, err
 	}
@@ -295,7 +295,7 @@ func (m *Manager) RevokeRefreshToken(ctx context.Context, refreshToken TokenValu
 		accessToken = state.Refresh.AccessToken
 	}
 	state.MarkRevoked(m.now())
-	if err := m.store.SaveTokenState(ctx, state, m.refreshTTL(m.now(), state)); err != nil {
+	if err := m.store.SaveTokenState(ctx, state, m.remainingTTL(m.now(), state)); err != nil {
 		return err
 	}
 	m.publish(ctx, Event{
@@ -326,15 +326,4 @@ func (m *Manager) RevokeRefreshByLoginID(ctx context.Context, loginID string, op
 		LoginType: subject.LoginType,
 	})
 	return nil
-}
-
-func (m *Manager) refreshTTL(now time.Time, state *TokenState) time.Duration {
-	if state == nil || state.ExpiresAt == nil {
-		return 0
-	}
-	ttl := state.ExpiresAt.Sub(now.UTC())
-	if ttl <= 0 {
-		return 0
-	}
-	return ttl
 }
