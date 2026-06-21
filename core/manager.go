@@ -10,13 +10,11 @@ import (
 )
 
 type Manager struct {
-	config        Config
-	store         Store
-	authorizer    Authorizer
-	eventBus      EventBus
-	runtime       Runtime
-	refreshConfig RefreshConfig
-	nonceConfig   NonceConfig
+	config     Config
+	store      Store
+	authorizer Authorizer
+	eventBus   EventBus
+	runtime    Runtime
 }
 
 func NewManager(store Store, opts ...Option) *Manager {
@@ -25,17 +23,15 @@ func NewManager(store Store, opts ...Option) *Manager {
 	}
 
 	m := &Manager{
-		config:        DefaultConfig(),
-		store:         store,
-		authorizer:    NoopAuthorizer{},
-		eventBus:      NewEventBus(),
-		runtime:       DefaultRuntime(),
-		refreshConfig: DefaultRefreshConfig(),
-		nonceConfig:   DefaultNonceConfig(),
+		config:     DefaultConfig(),
+		store:      store,
+		authorizer: NoopAuthorizer{},
+		eventBus:   NewEventBus(),
+		runtime:    DefaultRuntime(),
 	}
 	option.Apply(m, opts...)
-	m.refreshConfig = m.refreshConfig.withDefaults()
-	m.nonceConfig = m.nonceConfig.withDefaults()
+	m.config.Refresh = m.config.Refresh.withDefaults()
+	m.config.Nonce = m.config.Nonce.withDefaults()
 	return m
 }
 
@@ -295,7 +291,7 @@ func (m *Manager) LogoutByLoginID(ctx context.Context, loginID string, opts ...L
 
 // revokeRefreshForAccessToken 删除与给定 access token 关联的 refresh token 状态。
 func (m *Manager) revokeRefreshForAccessToken(ctx context.Context, state *TokenState) error {
-	if !m.refreshConfig.RevokeRefreshOnLogout || state == nil || state.Token == "" {
+	if !m.config.Refresh.RevokeRefreshOnLogout || state == nil || state.Token == "" {
 		return nil
 	}
 	states, err := m.store.FindTokenStates(ctx, state.Subject(), TokenKindRefresh)
@@ -315,7 +311,7 @@ func (m *Manager) revokeRefreshForAccessToken(ctx context.Context, state *TokenS
 
 // revokeRefreshForSubject 删除某登录主体下的全部 refresh token 状态。
 func (m *Manager) revokeRefreshForSubject(ctx context.Context, subject LoginSubject) error {
-	if !m.refreshConfig.RevokeRefreshOnLogout {
+	if !m.config.Refresh.RevokeRefreshOnLogout {
 		return nil
 	}
 	return m.store.DeleteTokenStates(ctx, subject.Normalize(), TokenKindRefresh)

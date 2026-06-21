@@ -33,13 +33,13 @@ func WithEventBus(eventBus EventBus) Option {
 
 func WithNonceConfig(config NonceConfig) Option {
 	return func(m *Manager) {
-		m.nonceConfig = config.withDefaults()
+		m.config.Nonce = config.withDefaults()
 	}
 }
 
 func WithRefreshConfig(config RefreshConfig) Option {
 	return func(m *Manager) {
-		m.refreshConfig = config.withDefaults()
+		m.config.Refresh = config.withDefaults()
 	}
 }
 

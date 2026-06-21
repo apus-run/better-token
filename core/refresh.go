@@ -103,8 +103,8 @@ func (m *Manager) LoginWithRefresh(ctx context.Context, loginID string, accessTo
 func (m *Manager) newRefreshState(refreshToken TokenValue, access *TokenState) *TokenState {
 	now := m.now()
 	var expiresAt *time.Time
-	if m.refreshConfig.Timeout > 0 {
-		exp := now.Add(m.refreshConfig.Timeout).UTC()
+	if m.config.Refresh.Timeout > 0 {
+		exp := now.Add(m.config.Refresh.Timeout).UTC()
 		expiresAt = &exp
 	}
 	return &TokenState{
@@ -136,10 +136,10 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 
 	flowOpts := refreshFlowOptions{}
 	option.Apply(&flowOpts, opts...)
-	if m.refreshConfig.RotateRefreshToken && flowOpts.nextRefreshToken == "" {
+	if m.config.Refresh.RotateRefreshToken && flowOpts.nextRefreshToken == "" {
 		return nil, ErrNextRefreshTokenRequired
 	}
-	if m.refreshConfig.RotateRefreshToken && flowOpts.nextRefreshToken == refreshToken {
+	if m.config.Refresh.RotateRefreshToken && flowOpts.nextRefreshToken == refreshToken {
 		return nil, ErrNextRefreshTokenReuse
 	}
 
@@ -147,7 +147,7 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 		state *TokenState
 		err   error
 	)
-	if m.refreshConfig.RotateRefreshToken {
+	if m.config.Refresh.RotateRefreshToken {
 		if state, err = m.loadUsableRefreshToken(ctx, refreshToken); err != nil {
 			return nil, err
 		}
@@ -165,7 +165,7 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 		return nil, err
 	}
 
-	if m.refreshConfig.RevokeAccessTokenOnRefresh && state.Refresh != nil && state.Refresh.AccessToken != "" {
+	if m.config.Refresh.RevokeAccessTokenOnRefresh && state.Refresh != nil && state.Refresh.AccessToken != "" {
 		if err := m.Logout(ctx, state.Refresh.AccessToken); err != nil && !errors.Is(err, ErrTokenNotFound) {
 			return nil, err
 		}
@@ -190,7 +190,7 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 
 	var nextRefreshState *TokenState
 	now := m.now()
-	if m.refreshConfig.RotateRefreshToken {
+	if m.config.Refresh.RotateRefreshToken {
 		nextRefreshState = m.newRefreshState(flowOpts.nextRefreshToken, tokenState)
 		nextRefreshState.Refresh.RotatedFrom = refreshToken
 		nextRefreshState.Refresh.LastUsedAt = utcTimePtr(now)
@@ -220,7 +220,7 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 }
 
 func (m *Manager) validateNextAccessToken(state *TokenState, nextAccessToken TokenValue) error {
-	if !m.refreshConfig.RevokeAccessTokenOnRefresh || state == nil || state.Refresh == nil || state.Refresh.AccessToken == "" {
+	if !m.config.Refresh.RevokeAccessTokenOnRefresh || state == nil || state.Refresh == nil || state.Refresh.AccessToken == "" {
 		return nil
 	}
 	if nextAccessToken == state.Refresh.AccessToken {

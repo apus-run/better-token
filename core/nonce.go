@@ -70,7 +70,7 @@ func (m *Manager) GenerateNonce(ctx context.Context, opts ...GenerateNonceOption
 	if err := ctxErr(ctx); err != nil {
 		return "", err
 	}
-	nonce, err := random.RandomString(m.nonceConfig.Length)
+	nonce, err := random.RandomString(m.config.Nonce.Length)
 	if err != nil {
 		return "", fmt.Errorf("generate nonce: %w", err)
 	}
@@ -81,7 +81,7 @@ func (m *Manager) GenerateNonce(ctx context.Context, opts ...GenerateNonceOption
 	generateOpts := generateNonceOptions{}
 	option.Apply(&generateOpts, opts...)
 	now := m.now()
-	expiresAt := now.Add(m.nonceConfig.Timeout).UTC()
+	expiresAt := now.Add(m.config.Nonce.Timeout).UTC()
 	subject := generateOpts.subject
 	state := &TokenState{
 		Token:        TokenValue(nonce),
@@ -95,7 +95,7 @@ func (m *Manager) GenerateNonce(ctx context.Context, opts ...GenerateNonceOption
 		Metadata:     cloneRawMessage(generateOpts.metadata),
 		Nonce:        &NonceInfo{Purpose: generateOpts.purpose},
 	}
-	if err := m.store.SaveTokenState(ctx, state, m.nonceConfig.Timeout); err != nil {
+	if err := m.store.SaveTokenState(ctx, state, m.config.Nonce.Timeout); err != nil {
 		return "", err
 	}
 	return state.Token, nil

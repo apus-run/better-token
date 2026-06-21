@@ -19,6 +19,11 @@ type Config struct {
 	ShareToken bool
 
 	RequireNonce bool
+
+	// Refresh / Nonce 是各自能力的配置组，随 Config 一同承载。
+	// 零值会在 NewManager 中由 withDefaults 兜底。
+	Refresh RefreshConfig
+	Nonce   NonceConfig
 }
 
 func DefaultConfig() Config {
@@ -31,5 +36,7 @@ func DefaultConfig() Config {
 		Concurrent:    true,
 		ShareToken:    false,
 		RequireNonce:  false,
+		Refresh:       DefaultRefreshConfig(),
+		Nonce:         DefaultNonceConfig(),
 	}
 }
