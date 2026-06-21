@@ -51,19 +51,18 @@
 
 ```go
 type Manager struct {
-    config        Config
-    store         Store
-    authorizer    Authorizer
-    eventBus      EventBus
-    runtime       Runtime
-    refreshConfig RefreshConfig   // refresh 行为默认值
-    nonceConfig   NonceConfig     // nonce 行为默认值
+    config     Config   // 含 RefreshConfig / NonceConfig 子结构（Config.Refresh / Config.Nonce）
+    store      Store
+    authorizer Authorizer
+    eventBus   EventBus
+    runtime    Runtime
 }
 ```
 
+- `Config` 承载 Manager 全部配置：登录态策略字段 + `RequireNonce` + 嵌套的 `Refresh RefreshConfig` / `Nonce NonceConfig` 子结构；`NewManager` 对 `config.Refresh` / `config.Nonce` 应用 `withDefaults`。
 - 删除字段 `nonceConsumer`、`refreshRevoker`；refresh/nonce 逻辑内联为 Manager 方法。
 - refresh/nonce **无需独立 store 或开关**：统一 `Store` 对所有 `TokenKind` 一视同仁。
-- 选项：`WithRefreshConfig(RefreshConfig)`、`WithNonceConfig(NonceConfig)`；删除 `WithNonceConsumer`。
+- 选项：`WithRefreshConfig(RefreshConfig)`、`WithNonceConfig(NonceConfig)`（写入 `config.Refresh` / `config.Nonce`）；删除 `WithNonceConsumer`。
 
 **`plugins/contract.go`**（框架无关认证内核）
 
@@ -355,12 +354,12 @@ type LoginResult struct {
 ### 4.3 Manager 构造选项
 
 ```go
-func WithRefreshConfig(c RefreshConfig) Option
-func WithNonceConfig(c NonceConfig) Option
+func WithRefreshConfig(c RefreshConfig) Option // 写入 config.Refresh
+func WithNonceConfig(c NonceConfig) Option      // 写入 config.Nonce
 // 删除 WithNonceConsumer
 ```
 
-无 refresh/nonce store 开关：统一 `Store` 始终支持全部 kind。`NewManager(store, opts...)` 签名不变。
+无 refresh/nonce store 开关：统一 `Store` 始终支持全部 kind。`NewManager(store, opts...)` 签名不变。`RefreshConfig` / `NonceConfig` 作为子结构嵌入 `Config`（`Config.Refresh` / `Config.Nonce`），因此也可通过 `WithConfig(Config{..., Refresh: ..., Nonce: ...})` 一次性设置。
 
 ### 4.4 gRPC 拦截器（US-014，FR-18~21）
 
