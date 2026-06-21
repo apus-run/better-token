@@ -14,6 +14,7 @@ package redis
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/apus-run/better-token/core"
@@ -156,11 +157,10 @@ func (s *Store) ConsumeTokenState(ctx context.Context, token core.TokenValue) (*
 	if err != nil {
 		return nil, false, err
 	}
-	status, raw, ok := cutNewline(result)
+	status, raw, _ := strings.Cut(result, "\n")
 	if status == "missing" || raw == "" {
 		return nil, false, nil
 	}
-	_ = ok
 	state := new(core.TokenState)
 	if err := json.Unmarshal([]byte(raw), state); err != nil {
 		return nil, false, err
@@ -412,15 +412,6 @@ if ttl and ttl > 0 then
 end
 return "fresh\n" .. value
 `
-
-func cutNewline(s string) (string, string, bool) {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			return s[:i], s[i+1:], true
-		}
-	}
-	return s, "", false
-}
 
 func (s *Store) tokenKey(token core.TokenValue) string {
 	return s.prefix + ":token:" + string(token)
