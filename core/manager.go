@@ -42,7 +42,12 @@ func (m *Manager) Config() Config {
 func (m *Manager) Login(ctx context.Context, loginID string, token TokenValue, opts ...LoginOption) (*TokenState, error) {
 	loginOpts := loginOptions{loginType: DefaultLoginType}
 	option.Apply(&loginOpts, opts...)
-	return m.login(ctx, loginID, token, loginOpts, true)
+	state, err := m.login(ctx, loginID, token, loginOpts, true)
+	if err != nil {
+		return nil, err
+	}
+	// 内部 state.Token 为存储键（哈希），交还调用方时注入其传入的明文 token。
+	return withPlaintextToken(state, token), nil
 }
 
 func (m *Manager) login(ctx context.Context, loginID string, token TokenValue, loginOpts loginOptions, enforceNonce bool) (*TokenState, error) {
@@ -67,17 +72,6 @@ func (m *Manager) login(ctx context.Context, loginID string, token TokenValue, l
 
 	now := m.now()
 	subject := LoginSubject{LoginID: loginID, LoginType: loginOpts.loginType}.Normalize()
-	if m.config.ShareToken {
-		states, err := m.store.FindTokenStates(ctx, subject, TokenKindAccess)
-		if err != nil {
-			return nil, err
-		}
-		for _, state := range states {
-			if state != nil && state.IsActive(now) {
-				return state.Clone(), nil
-			}
-		}
-	}
 
 	if !m.config.Concurrent {
 		if err := m.store.DeleteTokenStates(ctx, subject, TokenKindAccess); err != nil {
@@ -103,7 +97,7 @@ func (m *Manager) login(ctx context.Context, loginID string, token TokenValue, l
 		expiresAt = &exp
 	}
 	state := &TokenState{
-		Token:        token,
+		Token:        storeKey(token),
 		Kind:         TokenKindAccess,
 		LoginID:      subject.LoginID,
 		LoginType:    subject.LoginType,
@@ -132,7 +126,12 @@ func (m *Manager) login(ctx context.Context, loginID string, token TokenValue, l
 }
 
 func (m *Manager) GetTokenState(ctx context.Context, token TokenValue) (*TokenState, error) {
-	return m.getTokenState(ctx, token, true)
+	state, err := m.getTokenState(ctx, token, true)
+	if err != nil {
+		return nil, err
+	}
+	// 内部 state.Token 为存储键（哈希），交还调用方时注入其传入的明文 token。
+	return withPlaintextToken(state, token), nil
 }
 
 func (m *Manager) getTokenState(ctx context.Context, token TokenValue, allowAutoRenew bool) (*TokenState, error) {
@@ -141,8 +140,9 @@ func (m *Manager) getTokenState(ctx context.Context, token TokenValue, allowAuto
 	if token == "" {
 		return nil, ErrEmptyToken
 	}
+	key := storeKey(token)
 
-	state, ok, err := m.store.GetTokenState(ctx, token)
+	state, ok, err := m.store.GetTokenState(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +157,7 @@ func (m *Manager) getTokenState(ctx context.Context, token TokenValue, allowAuto
 
 	now := m.now()
 	if state.IsExpired(now) {
-		_ = m.store.DeleteTokenState(ctx, token)
+		_ = m.store.DeleteTokenState(ctx, key)
 		return nil, ErrTokenNotFound
 	}
 
@@ -244,7 +244,8 @@ func (m *Manager) Logout(ctx context.Context, token TokenValue) error {
 	if err != nil {
 		return err
 	}
-	if err := m.store.DeleteTokenState(ctx, token); err != nil {
+	// state.Token 已是存储键（哈希），直接按它删除，无需再对明文求键。
+	if err := m.store.DeleteTokenState(ctx, state.Token); err != nil {
 		return err
 	}
 	if err := m.revokeRefreshForAccessToken(ctx, state); err != nil {

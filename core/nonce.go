@@ -84,7 +84,7 @@ func (m *Manager) GenerateNonce(ctx context.Context, opts ...GenerateNonceOption
 	expiresAt := now.Add(m.config.Nonce.Timeout).UTC()
 	subject := generateOpts.subject
 	state := &TokenState{
-		Token:        TokenValue(nonce),
+		Token:        storeKey(TokenValue(nonce)),
 		Kind:         TokenKindNonce,
 		LoginID:      subject.LoginID,
 		LoginType:    subject.LoginType,
@@ -98,7 +98,8 @@ func (m *Manager) GenerateNonce(ctx context.Context, opts ...GenerateNonceOption
 	if err := m.store.SaveTokenState(ctx, state, m.config.Nonce.Timeout); err != nil {
 		return "", err
 	}
-	return state.Token, nil
+	// state.Token 是存储键（哈希），返回给调用方的必须是明文 nonce。
+	return TokenValue(nonce), nil
 }
 
 // ConsumeNonce 原子地消费一次性 nonce，重放/过期返回明确错误，返回消费后的 TokenState。
@@ -108,7 +109,7 @@ func (m *Manager) ConsumeNonce(ctx context.Context, nonce TokenValue) (*TokenSta
 	if nonce == "" {
 		return nil, ErrEmptyNonce
 	}
-	state, ok, err := m.store.ConsumeTokenState(ctx, nonce)
+	state, ok, err := m.store.ConsumeTokenState(ctx, storeKey(nonce))
 	if err != nil {
 		return nil, err
 	}
@@ -132,5 +133,6 @@ func (m *Manager) ConsumeNonce(ctx context.Context, nonce TokenValue) (*TokenSta
 		LoginType: state.LoginType,
 		Token:     state.Token,
 	})
-	return state.Clone(), nil
+	// 内部 state.Token 为存储键（哈希），交还调用方时注入其传入的明文 nonce。
+	return withPlaintextToken(state, nonce), nil
 }

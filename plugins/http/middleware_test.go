@@ -36,10 +36,18 @@ func TestExtractorOrderAndBearerPrefix(t *testing.T) {
 		t.Fatalf("Cookie should be third, got %q ok=%v", got, ok)
 	}
 
+	// 默认顺序不含 query：token 出现在 URL 会泄漏到日志/历史/Referer。
 	req = httptest.NewRequest(http.MethodGet, "/?bt=query-token", nil)
-	got, ok = extractor.ExtractToken(req)
+	if got, ok = extractor.ExtractToken(req); ok {
+		t.Fatalf("Query must NOT be extracted by default, got %q", got)
+	}
+
+	// 显式 opt-in 后 query 作为最后来源生效。
+	queryExtractor := NewExtractor(WithTokenName("bt"), WithTokenPrefix("Bearer"), WithQueryToken())
+	req = httptest.NewRequest(http.MethodGet, "/?bt=query-token", nil)
+	got, ok = queryExtractor.ExtractToken(req)
 	if !ok || got != "query-token" {
-		t.Fatalf("Query should be fourth, got %q ok=%v", got, ok)
+		t.Fatalf("Query should be extracted when opted in, got %q ok=%v", got, ok)
 	}
 }
 
@@ -49,7 +57,6 @@ func TestMiddlewareInjectsAuthContext(t *testing.T) {
 		TokenPrefix: "Bearer",
 		Timeout:     time.Hour,
 		Concurrent:  true,
-		ShareToken:  false,
 		AutoRenew:   false,
 	}))
 	if _, err := manager.Login(context.Background(), "1001", "http-token"); err != nil {
@@ -99,7 +106,8 @@ func TestTokenGeneratorIntegrationWithHTTPMiddleware(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
-	req := httptest.NewRequest(http.MethodGet, "/?token="+tokenStr, nil)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set(core.DefaultTokenName, tokenStr)
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, req)
 	if res.Code != http.StatusOK {

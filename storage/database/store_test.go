@@ -3,6 +3,7 @@ package database_test
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -378,6 +379,55 @@ func TestStoreNonceConsumeIsSingleUse(t *testing.T) {
 	}
 	if !second.IsConsumed() {
 		t.Fatal("second consumed state should be marked consumed")
+	}
+}
+
+// TestStoreNonceConsumeIsSingleUseConcurrent 断言并发消费下"仅一次拿到 fresh 快照"
+// 这一防重放不变量。ConsumeTokenState 以 UPDATE 实际命中行数为准来判定消费成功，
+// 而非仅凭 SELECT 时的快照——后者在不支持行锁的方言（FOR UPDATE 被静默丢弃）或
+// 连接池并发下会让多个消费者同时判定成功，造成 nonce/refresh 重放。
+// 注：mattn-sqlite3 在写冲突时对落败事务直接返回错误（fail-closed），因此该后端上
+// 本测试即使去掉 RowsAffected 校验也不会双消费；它在 -race 下守护不变量，真正的
+// 回归价值面向 MySQL/Postgres 等"active 读之后仍可能 UPDATE 命中 0 行"的后端。
+func TestStoreNonceConsumeIsSingleUseConcurrent(t *testing.T) {
+	store := newStore(t)
+	ctx := context.Background()
+
+	state := nonceState("nonce-race")
+	exp := time.Now().Add(time.Minute).UTC()
+	state.ExpiresAt = &exp
+	if err := store.SaveTokenState(ctx, state, time.Minute); err != nil {
+		t.Fatalf("SaveTokenState(nonce) failed: %v", err)
+	}
+
+	const n = 8
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		fresh int
+	)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			st, ok, err := store.ConsumeTokenState(ctx, "nonce-race")
+			if err != nil || !ok || st == nil {
+				return // 竞争落败或被库锁：安全地视为消费失败
+			}
+			if !st.IsConsumed() {
+				mu.Lock()
+				fresh++
+				mu.Unlock()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if fresh != 1 {
+		t.Fatalf("并发消费下应恰好一次拿到 fresh 快照，实得 %d", fresh)
 	}
 }
 

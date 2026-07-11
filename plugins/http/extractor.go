@@ -32,6 +32,10 @@ func NewExtractor(opts ...Option) Extractor {
 		TokenPrefix:      extractor.opts.tokenPrefix,
 		AuthorizationKey: extractor.opts.authorizationKey,
 	}
+	if extractor.opts.allowQuery {
+		// 显式 opt-in：在安全默认顺序之后追加 query 来源。
+		extractor.lookup.Order = append(append([]plugins.Source{}, plugins.DefaultOrder...), plugins.SourceQuery)
+	}
 	return extractor
 }
 

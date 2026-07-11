@@ -98,7 +98,7 @@ func TestManagerLoginGetRenewLogoutLifecycle(t *testing.T) {
 	}
 }
 
-func TestManagerConcurrentAndShareToken(t *testing.T) {
+func TestManagerSingleDeviceReplacesPreviousToken(t *testing.T) {
 	ctx := context.Background()
 
 	single := core.NewManager(memory.NewStore(), core.WithConfig(core.Config{
@@ -119,26 +119,23 @@ func TestManagerConcurrentAndShareToken(t *testing.T) {
 		t.Fatalf("token-2 should be valid: %v", err)
 	}
 
-	shared := core.NewManager(memory.NewStore(), core.WithConfig(core.Config{
+	// Concurrent=true 下两次登录各自签发独立 token，二者并存。
+	concurrent := core.NewManager(memory.NewStore(), core.WithConfig(core.Config{
 		TokenName:  "token",
 		Timeout:    time.Hour,
 		Concurrent: true,
-		ShareToken: true,
-		AutoRenew:  false,
 	}))
-	first, err := shared.Login(ctx, "2001", "token-a")
-	if err != nil {
-		t.Fatalf("First shared login failed: %v", err)
+	if _, err := concurrent.Login(ctx, "2001", "token-a"); err != nil {
+		t.Fatalf("First concurrent login failed: %v", err)
 	}
-	second, err := shared.Login(ctx, "2001", "token-b")
-	if err != nil {
-		t.Fatalf("Second shared login failed: %v", err)
+	if _, err := concurrent.Login(ctx, "2001", "token-b"); err != nil {
+		t.Fatalf("Second concurrent login failed: %v", err)
 	}
-	if second.Token != first.Token {
-		t.Fatalf("ShareToken should reuse first token, got %q want %q", second.Token, first.Token)
+	if _, err := concurrent.GetTokenState(ctx, "token-a"); err != nil {
+		t.Fatalf("token-a should remain valid under Concurrent, got %v", err)
 	}
-	if _, err := shared.GetTokenState(ctx, "token-b"); !errors.Is(err, core.ErrTokenNotFound) {
-		t.Fatalf("token-b should not be saved, got %v", err)
+	if _, err := concurrent.GetTokenState(ctx, "token-b"); err != nil {
+		t.Fatalf("token-b should be valid: %v", err)
 	}
 }
 
@@ -201,7 +198,6 @@ func TestManagerAutoRenewKeepsSessionAlive(t *testing.T) {
 			ActiveTimeout: 5 * time.Minute,
 			AutoRenew:     true,
 			Concurrent:    true,
-			ShareToken:    false,
 		}),
 	)
 

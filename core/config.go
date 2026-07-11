@@ -16,7 +16,6 @@ type Config struct {
 	AutoRenew     bool
 
 	Concurrent bool
-	ShareToken bool
 
 	RequireNonce bool
 
@@ -34,7 +33,6 @@ func DefaultConfig() Config {
 		ActiveTimeout: 0,
 		AutoRenew:     false,
 		Concurrent:    true,
-		ShareToken:    false,
 		RequireNonce:  false,
 		Refresh:       DefaultRefreshConfig(),
 		Nonce:         DefaultNonceConfig(),

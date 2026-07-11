@@ -146,7 +146,6 @@ type app struct {
 	manager    *core.Manager // base：多端并发、不强制 nonce，承担校验与所有 /admin 操作
 	nonceMgr   *core.Manager // RequireNonce=true，演示一次性 nonce 防重放
 	singleMgr  *core.Manager // Concurrent=false，演示单设备登录（异地挤下线）
-	sharedMgr  *core.Manager // ShareToken=true，演示共享会话（单点会话复用）
 	authorizer *rbac.Authorizer
 	generator  *token.TokenGenerator[map[string]string]
 	audits     *memoryAuditSink
@@ -170,7 +169,6 @@ func loginScenarios() []loginScenario {
 		{Key: "basic", Tab: "普通登录", Button: "账号密码登录", Desc: "只签发单个 access token，多端可同时在线。最常见的后台 / Web 登录。"},
 		{Key: "nonce", Tab: "安全登录", Button: "Nonce 防重放登录", Desc: "登录页预发一次性 nonce，提交时由服务端消费；重放或过期会被拒绝。后台、支付确认等高安全入口。"},
 		{Key: "single", Tab: "单设备登录", Button: "登录并踢掉其它设备", Desc: "Concurrent=false：登录成功后该账号其它设备立即下线。银行、敏感系统的单会话策略。"},
-		{Key: "shared", Tab: "共享会话", Button: "复用已有会话登录", Desc: "ShareToken=true：同账号重复登录复用同一 token，实现单点会话。"},
 	}
 }
 
@@ -266,7 +264,6 @@ func newApp(cfg config) (*app, error) {
 		db: gdb, manager: manager, authorizer: authorizer,
 		nonceMgr:  buildManager(store, authorizer, bus, func(c *core.Config) { c.RequireNonce = true }),
 		singleMgr: buildManager(store, authorizer, bus, func(c *core.Config) { c.Concurrent = false }),
-		sharedMgr: buildManager(store, authorizer, bus, func(c *core.Config) { c.ShareToken = true }),
 		generator: token.NewTokenGenerator[map[string]string](token.WithTokenStyle(token.TokenStyleUUID)),
 		audits:    audits, eventBus: bus, storeName: cfg.tokenStore,
 	}
@@ -482,17 +479,6 @@ func (a *app) performLogin(ctx context.Context, mode, loginID, device, nonce str
 			return "", "", err
 		}
 		return result.TokenState.Token, result.RefreshState.Token, nil
-
-	case "shared": // 共享会话：ShareToken=true，同账号复用已有有效 token。
-		access, err := a.generate(loginID, "access")
-		if err != nil {
-			return "", "", err
-		}
-		state, err := a.sharedMgr.Login(ctx, loginID, access, opts...)
-		if err != nil {
-			return "", "", err
-		}
-		return state.Token, "", nil
 
 	default: // refresh：记住我，签发 access + refresh。
 		access, refresh, err := a.generatePair(loginID)

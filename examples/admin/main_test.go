@@ -128,23 +128,6 @@ func TestLoginModeBasicIssuesOnlyAccess(t *testing.T) {
 	}
 }
 
-func TestLoginModeSharedReusesToken(t *testing.T) {
-	a, router := newTestApp(t)
-
-	first := loginWithMode(t, router, "shared", "web")
-	second := loginWithMode(t, router, "shared", "phone")
-	if cookieValue(first, accessCookie) != cookieValue(second, accessCookie) {
-		t.Fatal("shared login should reuse the same access token across logins")
-	}
-	states, err := a.manager.ListTokenStates(t.Context(), "1", core.WithListLoginType(loginType))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(states) != 1 {
-		t.Fatalf("shared login states=%d, want 1 (single shared session)", len(states))
-	}
-}
-
 func TestLoginModeSingleKicksOtherDevices(t *testing.T) {
 	a, router := newTestApp(t)
 
@@ -267,8 +250,10 @@ func TestOperatorRoleAndScenarioRestrictions(t *testing.T) {
 	if len(states) != 2 {
 		t.Fatalf("operator states=%d, want 2", len(states))
 	}
-	if state := stateByDevice(states, "ops-phone"); state == nil || len(state.Token) != 24 {
-		t.Fatalf("operator simple token = %v, want length 24", state)
+	// ListTokenStates 返回的 Token 是不透明存储键（SHA-256 十六进制，64 字符），
+	// 而非明文 token——无法再据此区分 token 风格。
+	if state := stateByDevice(states, "ops-phone"); state == nil || len(state.Token) != 64 {
+		t.Fatalf("operator listed token should be a 64-char storage hash, got %v", state)
 	}
 }
 
@@ -336,8 +321,9 @@ func TestAdminScenarioMultiDeviceControls(t *testing.T) {
 	if len(states) != 1 {
 		t.Fatalf("operator scenario states=%d, want 1", len(states))
 	}
-	if state := stateByDevice(states, "ops-tablet"); state == nil || len(state.Token) != 11 {
-		t.Fatalf("operator tiktok token = %v, want length 11", state)
+	// 同上：ListTokenStates 返回哈希存储键，长度恒为 64。
+	if state := stateByDevice(states, "ops-tablet"); state == nil || len(state.Token) != 64 {
+		t.Fatalf("operator listed token should be a 64-char storage hash, got %v", state)
 	}
 
 	w = request(t, router, http.MethodPost, "/admin/scenarios/logout-user", url.Values{"login_id": {strconvID(operator.ID)}}, cookies)

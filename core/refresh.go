@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"strings"
 	"time"
 
@@ -81,23 +80,30 @@ func (m *Manager) LoginWithRefresh(ctx context.Context, loginID string, accessTo
 		return nil, ErrEmptyRefreshToken
 	}
 
-	state, err := m.Login(ctx, loginID, accessToken, opts...)
+	// 走内部 login 拿到 Token 为存储键（哈希）的 access 状态，以便 refresh 关联链
+	// （RefreshInfo.AccessToken）也存哈希键；交还调用方时再注入明文。
+	loginOpts := loginOptions{loginType: DefaultLoginType}
+	option.Apply(&loginOpts, opts...)
+	accessState, err := m.login(ctx, loginID, accessToken, loginOpts, true)
 	if err != nil {
 		return nil, err
 	}
 
-	refreshState := m.newRefreshState(refreshToken, state)
+	refreshState := m.newRefreshState(refreshToken, accessState)
 	if err := m.store.SaveTokenState(ctx, refreshState, m.remainingTTL(m.now(), refreshState)); err != nil {
-		_ = m.Logout(ctx, state.Token)
+		_ = m.store.DeleteTokenState(ctx, accessState.Token) // 回滚 access，Token 已是哈希键
 		return nil, err
 	}
 	m.publish(ctx, Event{
 		Type:      EventRefreshIssued,
-		LoginID:   state.LoginID,
-		LoginType: state.LoginType,
-		Token:     state.Token,
+		LoginID:   accessState.LoginID,
+		LoginType: accessState.LoginType,
+		Token:     accessState.Token,
 	})
-	return &LoginResult{TokenState: state.Clone(), RefreshState: refreshState.Clone()}, nil
+	return &LoginResult{
+		TokenState:   withPlaintextToken(accessState, accessToken),
+		RefreshState: withPlaintextToken(refreshState, refreshToken),
+	}, nil
 }
 
 func (m *Manager) newRefreshState(refreshToken TokenValue, access *TokenState) *TokenState {
@@ -107,8 +113,10 @@ func (m *Manager) newRefreshState(refreshToken TokenValue, access *TokenState) *
 		exp := now.Add(m.config.Refresh.Timeout).UTC()
 		expiresAt = &exp
 	}
+	// access.Token 必须已是存储键（哈希）——所有调用方均经内部 login 构造 access。
+	// 于是 refresh 状态的 Token 与其关联的 AccessToken 一致地以哈希落库，无明文。
 	return &TokenState{
-		Token:        refreshToken,
+		Token:        storeKey(refreshToken),
 		Kind:         TokenKindRefresh,
 		LoginID:      access.LoginID,
 		LoginType:    access.LoginType,
@@ -166,9 +174,15 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 	}
 
 	if m.config.Refresh.RevokeAccessTokenOnRefresh && state.Refresh != nil && state.Refresh.AccessToken != "" {
-		if err := m.Logout(ctx, state.Refresh.AccessToken); err != nil && !errors.Is(err, ErrTokenNotFound) {
+		// AccessToken 已是旧 access 的存储键（哈希），直接按键删除（幂等）并发布登出。
+		if err := m.store.DeleteTokenState(ctx, state.Refresh.AccessToken); err != nil {
 			return nil, err
 		}
+		m.publish(ctx, Event{
+			Type:      EventLogout,
+			LoginID:   state.LoginID,
+			LoginType: state.LoginType,
+		})
 	}
 
 	device := state.Device
@@ -192,7 +206,8 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 	now := m.now()
 	if m.config.Refresh.RotateRefreshToken {
 		nextRefreshState = m.newRefreshState(flowOpts.nextRefreshToken, tokenState)
-		nextRefreshState.Refresh.RotatedFrom = refreshToken
+		// RotatedFrom 是旧 refresh 的引用，同样以存储键（哈希）记录，避免明文落库。
+		nextRefreshState.Refresh.RotatedFrom = storeKey(refreshToken)
 		nextRefreshState.Refresh.LastUsedAt = utcTimePtr(now)
 	} else {
 		if state.Refresh == nil {
@@ -206,7 +221,7 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 		nextRefreshState = state
 	}
 	if err := m.store.SaveTokenState(ctx, nextRefreshState, m.remainingTTL(now, nextRefreshState)); err != nil {
-		_ = m.Logout(ctx, tokenState.Token)
+		_ = m.store.DeleteTokenState(ctx, tokenState.Token) // 回滚新 access，Token 已是哈希键
 		return nil, err
 	}
 
@@ -216,21 +231,31 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 		LoginType: tokenState.LoginType,
 		Token:     tokenState.Token,
 	})
-	return &LoginResult{TokenState: tokenState.Clone(), RefreshState: nextRefreshState.Clone()}, nil
+	// 轮换模式返回新签发的 refresh 明文；非轮换沿用调用方传入的 refresh 明文。
+	plaintextRefresh := refreshToken
+	if m.config.Refresh.RotateRefreshToken {
+		plaintextRefresh = flowOpts.nextRefreshToken
+	}
+	return &LoginResult{
+		TokenState:   withPlaintextToken(tokenState, nextAccessToken),
+		RefreshState: withPlaintextToken(nextRefreshState, plaintextRefresh),
+	}, nil
 }
 
 func (m *Manager) validateNextAccessToken(state *TokenState, nextAccessToken TokenValue) error {
 	if !m.config.Refresh.RevokeAccessTokenOnRefresh || state == nil || state.Refresh == nil || state.Refresh.AccessToken == "" {
 		return nil
 	}
-	if nextAccessToken == state.Refresh.AccessToken {
+	// state.Refresh.AccessToken 是旧 access 的存储键（哈希），故与新 access 的键比较。
+	if storeKey(nextAccessToken) == state.Refresh.AccessToken {
 		return ErrNextAccessTokenReuse
 	}
 	return nil
 }
 
 func (m *Manager) loadUsableRefreshToken(ctx context.Context, refreshToken TokenValue) (*TokenState, error) {
-	state, ok, err := m.store.GetTokenState(ctx, refreshToken)
+	key := storeKey(refreshToken)
+	state, ok, err := m.store.GetTokenState(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -245,14 +270,14 @@ func (m *Manager) loadUsableRefreshToken(ctx context.Context, refreshToken Token
 		return nil, ErrRefreshTokenRevoked
 	}
 	if state.IsExpired(m.now()) {
-		_ = m.store.DeleteTokenState(ctx, refreshToken)
+		_ = m.store.DeleteTokenState(ctx, key)
 		return nil, ErrRefreshTokenExpired
 	}
 	return state, nil
 }
 
 func (m *Manager) consumeUsableRefreshToken(ctx context.Context, refreshToken TokenValue) (*TokenState, error) {
-	state, ok, err := m.store.ConsumeTokenState(ctx, refreshToken)
+	state, ok, err := m.store.ConsumeTokenState(ctx, storeKey(refreshToken))
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +304,7 @@ func (m *Manager) RevokeRefreshToken(ctx context.Context, refreshToken TokenValu
 	if refreshToken == "" {
 		return ErrEmptyRefreshToken
 	}
-	state, ok, err := m.store.GetTokenState(ctx, refreshToken)
+	state, ok, err := m.store.GetTokenState(ctx, storeKey(refreshToken))
 	if err != nil {
 		return err
 	}

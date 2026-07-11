@@ -208,7 +208,30 @@ func (s *Store) ConsumeTokenState(ctx context.Context, token core.TokenValue) (*
 		result := tx.Model(&tokenStateRecord{}).
 			Where("token = ? AND status = ?", string(token), string(core.TokenStatusActive)).
 			Updates(map[string]any{"status": string(core.TokenStatusConsumed), "state_json": data})
-		return result.Error
+		if result.Error != nil {
+			return result.Error
+		}
+		// 不能仅凭 SELECT 时读到的 active 快照就判定消费成功：SQLite 等方言会
+		// 静默丢弃 FOR UPDATE，两个并发事务可同时读到 active。以本事务 UPDATE
+		// 实际命中的行数为准——命中 0 行说明消费权已被其它事务抢走，回读当前行
+		// 返回其真实（已 consumed）快照，让上层的重放检测生效，杜绝 nonce/refresh 双花。
+		if result.RowsAffected == 0 {
+			var current tokenStateRecord
+			if err := tx.Where("token = ?", string(token)).First(&current).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					found = false
+					state = nil
+					return nil
+				}
+				return err
+			}
+			reloaded, err := decodeTokenState(current.StateJSON)
+			if err != nil {
+				return err
+			}
+			state = reloaded.Clone()
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, false, err

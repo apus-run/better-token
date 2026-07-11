@@ -44,8 +44,10 @@ func TestRefreshLoginAndRefreshRotation(t *testing.T) {
 	if _, err := manager.GetTokenState(ctx, "access-2"); err != nil {
 		t.Fatalf("new access token should be valid: %v", err)
 	}
-	if _, err := manager.Refresh(ctx, "refresh-1", "access-x", core.WithNextRefreshToken("refresh-x")); !errors.Is(err, core.ErrRefreshTokenNotFound) {
-		t.Fatalf("old refresh token should be revoked after rotation, got %v", err)
+	// 轮换后旧 refresh 被原子消费并保留 consumed 状态（用于重放检测），复用它被拒
+	// 为 ErrRefreshTokenRevoked（而非删除后的 NotFound）。
+	if _, err := manager.Refresh(ctx, "refresh-1", "access-x", core.WithNextRefreshToken("refresh-x")); !errors.Is(err, core.ErrRefreshTokenRevoked) {
+		t.Fatalf("old refresh token should be rejected after rotation, got %v", err)
 	}
 }
 

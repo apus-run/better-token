@@ -22,8 +22,11 @@ const (
 // DefaultAuthorizationKey 是默认的 Authorization 头名称。
 const DefaultAuthorizationKey = "Authorization"
 
-// DefaultOrder 是默认的 token 提取顺序。
-var DefaultOrder = []Source{SourceHeader, SourceAuthorization, SourceCookie, SourceQuery}
+// DefaultOrder 是默认的 token 提取顺序。出于安全考虑不含 SourceQuery：
+// token 出现在 URL query 会泄漏到反代访问日志、浏览器历史、跳转外站时的
+// Referer，等同会话劫持面。确需从 query 提取时，由上层显式启用
+// （如 http.WithQueryToken / gin.WithQueryToken）把 SourceQuery 追加进 Order。
+var DefaultOrder = []Source{SourceHeader, SourceAuthorization, SourceCookie}
 
 // Getters 由各框架提供，把“按 key 取字符串”的能力适配给契约，
 // 契约本身不依赖任何具体框架类型。任一 getter 为 nil 表示该来源不可用。
