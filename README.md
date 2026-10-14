@@ -288,3 +288,51 @@ router.GET("/me", func(c *gin.Context) {
 - SSO
 - RBAC 数据库表
 - 纯无状态 JWT 模式
+
+## Session 数据操作
+
+Session 保持显式保存：`Set`、`SetMulti`、`Remove`、`Clear` 修改快照，调用 `Manager.SaveSession` 持久化并处理错误。新增 `GetString`、`GetBool`、`GetInt`、`GetInt64`、`Keys`、`Size`、`IsEmpty`。
+
+```go
+session.SetMulti(map[string]any{"theme": "dark", "visits": int64(42)})
+if err := manager.SaveSession(ctx, session); err != nil {
+    return err
+}
+visits := session.GetInt64("visits")
+_ = visits
+```
+
+数据方法与序列化可并发使用。不要复制已使用的 Session 值，也不要并发写公开字段或修改 `Get` 返回的可变值；用 `Clone` 获取独立容器快照。Clone 递归复制 map、slice、array，保留类型和容器循环引用；自定义 struct/pointer 仍由调用方管理。
+
+从 JSON 恢复的数字使用 `json.Number` 保留精度，类型化 getter 可跨 memory、Redis、database 使用。直接对 `Get` 的结果断言 `float64` 的调用方应改用 getter，或显式处理 `json.Number`。整数 getter 支持精确的十进制和科学计数表示（如 `1000.0`、`1e3`），对非整数、越界与非数值返回 0。
+
+## Token Cookie
+
+Cookie 的读取、写入和清理复用 `plugins/http.CookieConfig`；Gin 提供同名类型与默认配置。默认 Path=/、HttpOnly=true、SameSite=Lax。使用 HTTPS 时配置 Secure=true。
+
+```go
+cookies := btHTTP.DefaultCookieConfig()
+cookies.Name = "access"
+cookies.Secure = true
+
+handler := btHTTP.Middleware(manager, btHTTP.WithCookieConfig(cookies))(next)
+_ = handler
+
+// Login / Refresh 成功后，将调用方持有的明文 token 写入 Cookie。
+if err := cookies.SetTokenCookie(w, state.Token, manager.Config().Timeout); err != nil {
+    return err
+}
+
+// Logout 成功后，以相同 Name / Path / Domain 清理浏览器凭证。
+if err := cookies.ClearTokenCookie(w); err != nil {
+    return err
+}
+```
+
+Cookie 写入原始 token，不拼 Header 前缀。正 TTL 设置浏览器期限，TTL≤0 创建浏览器会话 Cookie；服务端有效性仍由 Manager 判断。`WithCookieRead(false)` 可关闭 Cookie 来源，不影响 Header；Header 仍优先于 Cookie，URL query 仍须显式启用。
+
+显式 `WithCookieConfig` 的空 Name 在读写两侧均使用默认名 `token`；未指定 CookieConfig 时，读取仍沿用 TokenName。Path 必须为绝对路径。写入前验证 Cookie 内容和配置；SameSite=None 必须同时启用 Secure，`__Secure-` / `__Host-` 名称必须满足其属性约束。后台示例的登录、刷新、注销和撤销 refresh 已使用这些工具。
+
+不轮换 refresh 时，同一 refresh token 的并发刷新也会先原子占用，未取得执行权的请求不修改 access。完成后重新激活该 refresh；失败时使用条件更新释放占用，不覆盖并发撤销。若进程中断或存储故障导致无法释放，占用保持不可用，需要重新登录。
+
+Session 序列化会拒绝可见对象图中的循环引用并返回 JSON 错误，包括 Session 自引用和相互引用；自定义 JSON/Text marshaler 仍负责自身的编码逻辑。

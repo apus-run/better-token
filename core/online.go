@@ -102,9 +102,10 @@ func (m *Manager) MarkOnline(ctx context.Context, token TokenValue, info OnlineI
 	if state.Kind != TokenKindAccess {
 		return ErrUnsupportedKind
 	}
+	expected := state.Clone()
 	now := m.now()
 	state.MarkOnline(now, info)
-	if err := m.store.SaveTokenState(ctx, state, m.remainingTTL(now, state)); err != nil {
+	if err := m.updateTokenState(ctx, expected, state, m.remainingTTL(now, state)); err != nil {
 		return err
 	}
 	m.publish(ctx, Event{
@@ -126,9 +127,10 @@ func (m *Manager) MarkOffline(ctx context.Context, token TokenValue) error {
 	if state.Kind != TokenKindAccess {
 		return ErrUnsupportedKind
 	}
+	expected := state.Clone()
 	now := m.now()
 	state.MarkOffline(now)
-	if err := m.store.SaveTokenState(ctx, state, m.remainingTTL(now, state)); err != nil {
+	if err := m.updateTokenState(ctx, expected, state, m.remainingTTL(now, state)); err != nil {
 		return err
 	}
 	m.publish(ctx, Event{

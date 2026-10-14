@@ -432,11 +432,15 @@ func (a *app) login(c *gin.Context) {
 
 	_ = a.manager.MarkOnline(c.Request.Context(), token, core.OnlineInfo{IP: c.ClientIP(), UserAgent: c.Request.UserAgent(), ConnectionID: form.Device})
 	session := core.NewSessionForSubject(core.LoginSubject{LoginID: loginID, LoginType: loginType})
-	session.Set("display_name", u.DisplayName)
-	session.Set("theme", "system")
-	session.Set("login_mode", scenarioTab(mode))
-	_ = a.manager.SaveSession(c.Request.Context(), session)
-	a.setAuthCookies(c, token, refresh)
+	session.SetMulti(map[string]any{"display_name": u.DisplayName, "theme": "system", "login_mode": scenarioTab(mode)})
+	if err := a.manager.SaveSession(c.Request.Context(), session); err != nil {
+		a.redirectError(c, "/", err.Error())
+		return
+	}
+	if err := a.setAuthCookies(c, token, refresh); err != nil {
+		a.redirectError(c, "/", err.Error())
+		return
+	}
 	redirectAfterPost(c, dashboardPath)
 }
 
@@ -532,11 +536,17 @@ func (a *app) refresh(c *gin.Context) {
 	}
 	result, err := a.manager.Refresh(c.Request.Context(), core.TokenValue(old), access, core.WithNextRefreshToken(refresh))
 	if err != nil {
-		a.clearAuthCookies(c)
+		if clearErr := a.clearAuthCookies(c); clearErr != nil {
+			a.redirectError(c, "/", clearErr.Error())
+			return
+		}
 		a.redirectError(c, "/", err.Error())
 		return
 	}
-	a.setAuthCookies(c, result.TokenState.Token, result.RefreshState.Token)
+	if err := a.setAuthCookies(c, result.TokenState.Token, result.RefreshState.Token); err != nil {
+		a.redirectError(c, "/", err.Error())
+		return
+	}
 	redirectAfterPost(c, dashboardPath)
 }
 
@@ -578,7 +588,7 @@ func (a *app) dashboard(c *gin.Context) {
 		"AuditPage": auditPage, "AuditPerPage": auditPerPage, "AuditTotalPages": auditTotalPages,
 		"Store": a.storeName, "CanManageUsers": a.canManageUsers(c),
 		"CanWriteSession": a.manager.CheckPermission(c.Request.Context(), "session:write") == nil,
-		"Message": c.Query("message"), "Error": c.Query("error"),
+		"Message":         c.Query("message"), "Error": c.Query("error"),
 	})
 }
 
@@ -594,7 +604,7 @@ func (a *app) scenarios(c *gin.Context) {
 		"Auth":           auth,
 		"Users":          scenarios,
 		"TokenStyles":    a.tokenStyleScenarios(auth.LoginID),
-	"JwtCustomData":  a.jwtCustomDataScenarios(auth.LoginID),
+		"JwtCustomData":  a.jwtCustomDataScenarios(auth.LoginID),
 		"CanManageUsers": a.canManageUsers(c),
 		"Message":        c.Query("message"),
 		"Error":          c.Query("error"),
@@ -852,7 +862,10 @@ func (a *app) logoutAll(c *gin.Context) {
 		a.actionError(c, err)
 		return
 	}
-	a.clearAuthCookies(c)
+	if clearErr := a.clearAuthCookies(c); clearErr != nil {
+		a.redirectError(c, "/", clearErr.Error())
+		return
+	}
 	redirectAfterPost(c, "/")
 }
 
@@ -863,7 +876,10 @@ func (a *app) logout(c *gin.Context) {
 		a.actionError(c, err)
 		return
 	}
-	a.clearAuthCookies(c)
+	if clearErr := a.clearAuthCookies(c); clearErr != nil {
+		a.redirectError(c, "/", clearErr.Error())
+		return
+	}
 	redirectAfterPost(c, "/")
 }
 
@@ -877,8 +893,12 @@ func (a *app) revokeRefresh(c *gin.Context) {
 		a.actionError(c, err)
 		return
 	}
-	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie(refreshCookie, "", -1, "/", "", false, true)
+	cookie := btgin.DefaultCookieConfig()
+	cookie.Name = refreshCookie
+	if err := cookie.ClearTokenCookie(c.Writer); err != nil {
+		a.actionError(c, err)
+		return
+	}
 	a.actionOK(c, "Refresh token 已撤销，当前 access token 仍可使用")
 }
 
@@ -1066,21 +1086,28 @@ func parseTokenStyle(value string) token.TokenStyle {
 	}
 }
 
-func (a *app) setAuthCookies(c *gin.Context, access, refresh core.TokenValue) {
-	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie(accessCookie, string(access), 30*60, "/", "", false, true)
-	if refresh == "" {
-		// 普通 / Nonce / 共享会话登录不签发 refresh token，清掉可能残留的旧 cookie。
-		c.SetCookie(refreshCookie, "", -1, "/", "", false, true)
-		return
+func (a *app) setAuthCookies(c *gin.Context, access, refresh core.TokenValue) error {
+	cookie := btgin.DefaultCookieConfig()
+	cookie.Name = accessCookie
+	if err := cookie.SetTokenCookie(c.Writer, access, 30*time.Minute); err != nil {
+		return err
 	}
-	c.SetCookie(refreshCookie, string(refresh), 7*24*60*60, "/", "", false, true)
+	cookie.Name = refreshCookie
+	if refresh == "" {
+		return cookie.ClearTokenCookie(c.Writer)
+	}
+	return cookie.SetTokenCookie(c.Writer, refresh, 7*24*time.Hour)
 }
 
-func (a *app) clearAuthCookies(c *gin.Context) {
-	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie(accessCookie, "", -1, "/", "", false, true)
-	c.SetCookie(refreshCookie, "", -1, "/", "", false, true)
+func (a *app) clearAuthCookies(c *gin.Context) error {
+	cookie := btgin.DefaultCookieConfig()
+	for _, name := range []string{accessCookie, refreshCookie} {
+		cookie.Name = name
+		if err := cookie.ClearTokenCookie(c.Writer); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (a *app) render(c *gin.Context, name string, data gin.H) {

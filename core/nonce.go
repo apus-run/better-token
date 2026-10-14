@@ -109,7 +109,7 @@ func (m *Manager) ConsumeNonce(ctx context.Context, nonce TokenValue) (*TokenSta
 	if nonce == "" {
 		return nil, ErrEmptyNonce
 	}
-	state, ok, err := m.store.ConsumeTokenState(ctx, storeKey(nonce))
+	state, ok, err := m.consumeTokenState(ctx, storeKey(nonce), TokenKindNonce)
 	if err != nil {
 		return nil, err
 	}
@@ -122,6 +122,9 @@ func (m *Manager) ConsumeNonce(ctx context.Context, nonce TokenValue) (*TokenSta
 	}
 	if state.IsConsumed() {
 		return nil, ErrNonceReplayed
+	}
+	if state.Status != TokenStatusActive {
+		return nil, ErrTokenInvalid
 	}
 	if state.IsExpired(m.now()) {
 		return nil, ErrNonceExpired

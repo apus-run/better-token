@@ -127,8 +127,7 @@ func (s TokenState) IsConsumed() bool {
 
 func (s TokenState) IsActive(now time.Time) bool {
 	return !s.IsExpired(now) &&
-		s.Status != TokenStatusRevoked &&
-		s.Status != TokenStatusConsumed
+		(s.Status == "" || s.Status == TokenStatusActive)
 }
 
 // Subject 返回该 token 状态所归属的登录主体。

@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"reflect"
 	"sync"
 	"time"
 
@@ -9,7 +10,10 @@ import (
 	"github.com/apus-run/better-token/pkg/option"
 )
 
-var _ core.Store = (*Store)(nil)
+var (
+	_ core.Store       = (*Store)(nil)
+	_ core.AtomicStore = (*Store)(nil)
+)
 
 type Store struct {
 	mu       sync.RWMutex
@@ -54,6 +58,21 @@ func NewStore(opts ...Option) *Store {
 }
 
 func (s *Store) SaveTokenState(ctx context.Context, state *core.TokenState, ttl time.Duration) error {
+	return s.saveTokenState(ctx, nil, state, ttl)
+}
+
+func (s *Store) CompareAndSwapTokenState(ctx context.Context, expected, next *core.TokenState, ttl time.Duration) (bool, error) {
+	if expected == nil || next == nil || expected.Token != next.Token {
+		return false, core.ErrTokenInvalid
+	}
+	err := s.saveTokenState(ctx, expected, next, ttl)
+	if err == core.ErrTokenInvalid {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *Store) saveTokenState(ctx context.Context, expected, state *core.TokenState, ttl time.Duration) error {
 	if err := contextErr(ctx); err != nil {
 		return err
 	}
@@ -74,6 +93,12 @@ func (s *Store) SaveTokenState(ctx context.Context, state *core.TokenState, ttl 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if expected != nil {
+		old, ok := s.tokens[clone.Token]
+		if !ok || old.isExpired(s.now()) || !reflect.DeepEqual(old.state, expected) {
+			return core.ErrTokenInvalid
+		}
+	}
 	if old, ok := s.tokens[clone.Token]; ok && old.state != nil {
 		s.removeIndexLocked(old.state.Subject(), clone.Token)
 	}
@@ -119,6 +144,17 @@ func (s *Store) GetTokenState(ctx context.Context, token core.TokenValue) (*core
 }
 
 func (s *Store) ConsumeTokenState(ctx context.Context, token core.TokenValue) (*core.TokenState, bool, error) {
+	return s.consumeTokenState(ctx, token, "")
+}
+
+func (s *Store) ConsumeTokenStateOfKind(ctx context.Context, token core.TokenValue, kind core.TokenKind) (*core.TokenState, bool, error) {
+	if kind == "" {
+		return nil, false, core.ErrUnsupportedKind
+	}
+	return s.consumeTokenState(ctx, token, kind)
+}
+
+func (s *Store) consumeTokenState(ctx context.Context, token core.TokenValue, kind core.TokenKind) (*core.TokenState, bool, error) {
 	if err := contextErr(ctx); err != nil {
 		return nil, false, err
 	}
@@ -137,7 +173,7 @@ func (s *Store) ConsumeTokenState(ctx context.Context, token core.TokenValue) (*
 	}
 	// 返回消费前快照。
 	snapshot := item.state.Clone()
-	if item.state.IsActive(now) {
+	if item.state.IsActive(now) && (kind == "" || item.state.Kind == kind) {
 		item.state.MarkConsumed(now)
 	}
 	return snapshot, true, nil
@@ -232,6 +268,31 @@ func (s *Store) SaveSession(ctx context.Context, session *core.Session, ttl time
 	s.sessions[key] = &sessionItem{
 		session:   session.Clone(),
 		expiresAt: expiresAt,
+	}
+	return nil
+}
+
+func (s *Store) EnsureSession(ctx context.Context, subject core.LoginSubject, ttl time.Duration) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	subject = subject.Normalize()
+	if subject.IsZero() {
+		return core.ErrEmptySessionID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	item := s.sessions[subject]
+	if item == nil || item.isExpired(now) {
+		item = &sessionItem{session: core.NewSessionForSubject(subject)}
+		s.sessions[subject] = item
+	}
+	// Existing Data is owned by SaveSession, not by a lifetime update.
+	item.expiresAt = nil
+	if ttl > 0 {
+		expires := now.Add(ttl).UTC()
+		item.expiresAt = &expires
 	}
 	return nil
 }

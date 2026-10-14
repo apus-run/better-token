@@ -3,7 +3,6 @@
 package plugins
 
 import (
-	"context"
 	"strings"
 
 	"github.com/apus-run/better-token/core"
@@ -111,19 +110,4 @@ func (l TokenLookup) normalize(value string) (core.TokenValue, bool) {
 		return "", false
 	}
 	return core.TokenValue(value), true
-}
-
-// Authenticate 用 Manager 校验 token 并构造认证上下文，要求 token 的 Kind==access。
-func Authenticate(ctx context.Context, m *core.Manager, token core.TokenValue) (*core.AuthContext, error) {
-	if m == nil {
-		return nil, core.ErrNotLogin
-	}
-	state, err := m.GetTokenState(ctx, token)
-	if err != nil {
-		return nil, err
-	}
-	if state.Kind != core.TokenKindAccess {
-		return nil, core.ErrTokenInvalid
-	}
-	return core.NewAuthContext(state), nil
 }

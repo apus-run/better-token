@@ -9,11 +9,17 @@ import (
 )
 
 type Option = httpplugin.Option
+type CookieConfig = httpplugin.CookieConfig
+
+var DefaultCookieConfig = httpplugin.DefaultCookieConfig
 
 var (
 	WithTokenName    = httpplugin.WithTokenName
 	WithTokenPrefix  = httpplugin.WithTokenPrefix
 	WithUnauthorized = httpplugin.WithUnauthorized
+	WithQueryToken   = httpplugin.WithQueryToken
+	WithCookieConfig = httpplugin.WithCookieConfig
+	WithCookieRead   = httpplugin.WithCookieRead
 )
 
 func Middleware(manager *core.Manager, opts ...Option) gin.HandlerFunc {

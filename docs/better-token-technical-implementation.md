@@ -63,7 +63,8 @@ better-token/
       store.go
 
   plugins/
-    contract.go
+    lookup.go
+    authenticate.go
     http/
       middleware.go
       extractor.go
@@ -1552,7 +1553,7 @@ better-token core 只承认和管理 TokenState；token 包负责生成 token，
   - 配置：`core.WithRefreshConfig` / `core.WithNonceConfig`；统一 `Store` 天然支持全部 kind，无需独立的 refresh/nonce store 开关。
 - **统一 Store**：`Store` 仅含 TokenState + Session 方法；`FindTokenStates` / `DeleteTokenStates` 带 `kinds ...TokenKind` 过滤；新增原子 `ConsumeTokenState`。不存在 `RefreshStore` / `NonceStore` / `RefreshTokenState` / `NonceState`——refresh / nonce 均以 `Kind` 区分的统一 `TokenState`（配合 `RefreshInfo` / `NonceInfo`）表达，与第 8、9 节一致。
 - **错误模型**：`GetTokenState` 命中 `revoked` / `consumed` 返回 `ErrTokenInvalid`；新增 `ErrUnsupportedKind`。
-- **plugins 契约**：`plugins/contract.go` 提供框架无关的 `TokenLookup` / `Authenticate`（要求 `Kind==access`），由 `plugins/http`、`plugins/gin`、`plugins/grpc` 复用。
+- **plugins 共享逻辑**：`plugins/lookup.go` 提供框架无关的 `TokenLookup`，`plugins/authenticate.go` 提供 `Authenticate`（要求 `Kind==access`），由 `plugins/http`、`plugins/gin`、`plugins/grpc` 复用。
 - **第三阶段**：`plugins/grpc` 为独立 go module（server + client 拦截器）；`audit` 包提供独立 `AuditEventType` + 默认 slog Sink 的审计监听器。
 
 > 注：`token` 包的 `TokenConfig` / `JwtConfig` 目前位于 `token/jwt.go` 与 `token/generator.go`；第 2 节示意的 `token/config.go` 归位为可选清理项，尚未执行，不影响对外导出符号。

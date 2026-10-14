@@ -3,6 +3,7 @@ package http
 import (
 	"net/http"
 
+	"github.com/apus-run/better-token/core"
 	"github.com/apus-run/better-token/pkg/option"
 )
 
@@ -14,6 +15,8 @@ type options struct {
 	unauthorized     func(http.ResponseWriter, *http.Request)
 	authorizationKey string
 	allowQuery       bool
+	readCookie       bool
+	cookieConfig     CookieConfig
 }
 
 func WithTokenName(name string) Option {
@@ -45,4 +48,19 @@ func WithQueryToken() Option {
 	return func(opts *options) {
 		opts.allowQuery = true
 	}
+}
+
+// WithCookieConfig shares the cookie name and attributes with the writer helpers.
+// An explicit config with an empty Name uses the same default as its writer.
+// Without this option, cookie extraction continues to follow TokenName.
+func WithCookieConfig(config CookieConfig) Option {
+	if config.Name == "" {
+		config.Name = core.DefaultTokenName
+	}
+	return func(opts *options) { opts.cookieConfig = config }
+}
+
+// WithCookieRead enables or disables cookie credentials. The default is enabled.
+func WithCookieRead(enabled bool) Option {
+	return func(opts *options) { opts.readCookie = enabled }
 }

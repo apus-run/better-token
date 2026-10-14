@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -80,6 +82,10 @@ func (m *Manager) LoginWithRefresh(ctx context.Context, loginID string, accessTo
 		return nil, ErrEmptyRefreshToken
 	}
 
+	if storeKey(accessToken) == storeKey(refreshToken) {
+		return nil, ErrNextRefreshTokenReuse
+	}
+
 	// 走内部 login 拿到 Token 为存储键（哈希）的 access 状态，以便 refresh 关联链
 	// （RefreshInfo.AccessToken）也存哈希键；交还调用方时再注入明文。
 	loginOpts := loginOptions{loginType: DefaultLoginType}
@@ -131,7 +137,7 @@ func (m *Manager) newRefreshState(refreshToken TokenValue, access *TokenState) *
 }
 
 // Refresh 用合法 refresh token 换新 access token。
-func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken TokenValue, opts ...RefreshFlowOption) (*LoginResult, error) {
+func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken TokenValue, opts ...RefreshFlowOption) (result *LoginResult, err error) {
 	ctx = normalizeContext(ctx)
 	refreshToken = TokenValue(strings.TrimSpace(string(refreshToken)))
 	nextAccessToken = TokenValue(strings.TrimSpace(string(nextAccessToken)))
@@ -151,25 +157,42 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 		return nil, ErrNextRefreshTokenReuse
 	}
 
-	var (
-		state *TokenState
-		err   error
-	)
-	if m.config.Refresh.RotateRefreshToken {
-		if state, err = m.loadUsableRefreshToken(ctx, refreshToken); err != nil {
-			return nil, err
-		}
-		if err = m.validateNextAccessToken(state, nextAccessToken); err != nil {
-			return nil, err
-		}
-		state, err = m.consumeUsableRefreshToken(ctx, refreshToken)
-	} else {
-		state, err = m.loadUsableRefreshToken(ctx, refreshToken)
+	if nextAccessToken == refreshToken {
+		return nil, ErrNextAccessTokenReuse
 	}
+	if m.config.Refresh.RotateRefreshToken && nextAccessToken == flowOpts.nextRefreshToken {
+		return nil, ErrNextRefreshTokenReuse
+	}
+	state, err := m.loadUsableRefreshToken(ctx, refreshToken)
 	if err != nil {
 		return nil, err
 	}
-	if err = m.validateNextAccessToken(state, nextAccessToken); err != nil {
+	if err = m.validateNextAccessToken(state, nextAccessToken, flowOpts.nextRefreshToken); err != nil {
+		return nil, err
+	}
+	// Both modes claim the refresh before touching access/session state. In
+	// reusable mode consumed is an in-flight claim, reactivated only by its owner.
+	state, err = m.consumeUsableRefreshToken(ctx, refreshToken)
+	if err != nil {
+		return nil, err
+	}
+	expected := state.Clone()
+	expected.MarkConsumed(m.now())
+	restore := !m.config.Refresh.RotateRefreshToken
+	if restore {
+		original := state.Clone()
+		defer func() {
+			if !restore {
+				return
+			}
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if cleanupErr := m.updateTokenState(cleanup, expected, original, m.remainingTTL(m.now(), original)); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("restore refresh token: %w", cleanupErr))
+			}
+		}()
+	}
+	if err = m.validateNextAccessToken(state, nextAccessToken, flowOpts.nextRefreshToken); err != nil {
 		return nil, err
 	}
 
@@ -193,10 +216,15 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 	if len(flowOpts.metadata) > 0 {
 		metadata = cloneRawMessage(flowOpts.metadata)
 	}
+	keepRefresh := TokenValue("")
+	if !m.config.Refresh.RotateRefreshToken {
+		keepRefresh = state.Token
+	}
 	tokenState, err := m.login(ctx, state.LoginID, nextAccessToken, loginOptions{
-		loginType: state.LoginType,
-		device:    device,
-		metadata:  metadata,
+		preserveRefresh: keepRefresh,
+		loginType:       state.LoginType,
+		device:          device,
+		metadata:        metadata,
 	}, false)
 	if err != nil {
 		return nil, err
@@ -220,10 +248,16 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 		state.Touch(now)
 		nextRefreshState = state
 	}
-	if err := m.store.SaveTokenState(ctx, nextRefreshState, m.remainingTTL(now, nextRefreshState)); err != nil {
+	if m.config.Refresh.RotateRefreshToken {
+		err = m.store.SaveTokenState(ctx, nextRefreshState, m.remainingTTL(now, nextRefreshState))
+	} else {
+		err = m.updateTokenState(ctx, expected, nextRefreshState, m.remainingTTL(now, nextRefreshState))
+	}
+	if err != nil {
 		_ = m.store.DeleteTokenState(ctx, tokenState.Token) // 回滚新 access，Token 已是哈希键
 		return nil, err
 	}
+	restore = false
 
 	m.publish(ctx, Event{
 		Type:      EventRefresh,
@@ -242,7 +276,10 @@ func (m *Manager) Refresh(ctx context.Context, refreshToken, nextAccessToken Tok
 	}, nil
 }
 
-func (m *Manager) validateNextAccessToken(state *TokenState, nextAccessToken TokenValue) error {
+func (m *Manager) validateNextAccessToken(state *TokenState, nextAccessToken, nextRefreshToken TokenValue) error {
+	if m.config.Refresh.RotateRefreshToken && state != nil && state.Refresh != nil && storeKey(nextRefreshToken) == state.Refresh.AccessToken {
+		return ErrNextRefreshTokenReuse
+	}
 	if !m.config.Refresh.RevokeAccessTokenOnRefresh || state == nil || state.Refresh == nil || state.Refresh.AccessToken == "" {
 		return nil
 	}
@@ -266,7 +303,7 @@ func (m *Manager) loadUsableRefreshToken(ctx context.Context, refreshToken Token
 	if state.Kind != TokenKindRefresh {
 		return nil, ErrUnsupportedKind
 	}
-	if state.IsRevoked() || state.IsConsumed() {
+	if state.Status != TokenStatusActive {
 		return nil, ErrRefreshTokenRevoked
 	}
 	if state.IsExpired(m.now()) {
@@ -277,7 +314,7 @@ func (m *Manager) loadUsableRefreshToken(ctx context.Context, refreshToken Token
 }
 
 func (m *Manager) consumeUsableRefreshToken(ctx context.Context, refreshToken TokenValue) (*TokenState, error) {
-	state, ok, err := m.store.ConsumeTokenState(ctx, storeKey(refreshToken))
+	state, ok, err := m.consumeTokenState(ctx, storeKey(refreshToken), TokenKindRefresh)
 	if err != nil {
 		return nil, err
 	}
@@ -288,7 +325,7 @@ func (m *Manager) consumeUsableRefreshToken(ctx context.Context, refreshToken To
 	if state.Kind != TokenKindRefresh {
 		return nil, ErrUnsupportedKind
 	}
-	if state.IsRevoked() || state.IsConsumed() {
+	if state.Status != TokenStatusActive {
 		return nil, ErrRefreshTokenRevoked
 	}
 	if state.IsExpired(m.now()) {
@@ -319,8 +356,9 @@ func (m *Manager) RevokeRefreshToken(ctx context.Context, refreshToken TokenValu
 	if state.Refresh != nil {
 		accessToken = state.Refresh.AccessToken
 	}
+	expected := state.Clone()
 	state.MarkRevoked(m.now())
-	if err := m.store.SaveTokenState(ctx, state, m.remainingTTL(m.now(), state)); err != nil {
+	if err := m.updateTokenState(ctx, expected, state, m.remainingTTL(m.now(), state)); err != nil {
 		return err
 	}
 	m.publish(ctx, Event{

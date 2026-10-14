@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"time"
 
 	"github.com/apus-run/better-token/core"
@@ -25,7 +26,10 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-var _ core.Store = (*Store)(nil)
+var (
+	_ core.Store       = (*Store)(nil)
+	_ core.AtomicStore = (*Store)(nil)
+)
 
 // tokenStateRecord 是统一 token 状态的持久化行。完整 TokenState 存于 StateJSON，
 // 其余列用于按主体/kind 索引、过期过滤与原子消费。
@@ -93,6 +97,21 @@ func (s *Store) Migrate(ctx context.Context) error {
 }
 
 func (s *Store) SaveTokenState(ctx context.Context, state *core.TokenState, ttl time.Duration) error {
+	return s.saveTokenState(ctx, nil, state, ttl)
+}
+
+func (s *Store) CompareAndSwapTokenState(ctx context.Context, expected, next *core.TokenState, ttl time.Duration) (bool, error) {
+	if expected == nil || next == nil || expected.Token != next.Token {
+		return false, core.ErrTokenInvalid
+	}
+	err := s.saveTokenState(ctx, expected, next, ttl)
+	if err == core.ErrTokenInvalid {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *Store) saveTokenState(ctx context.Context, expected, state *core.TokenState, ttl time.Duration) error {
 	if err := contextErr(ctx); err != nil {
 		return err
 	}
@@ -124,6 +143,32 @@ func (s *Store) SaveTokenState(ctx context.Context, state *core.TokenState, ttl 
 		LastActiveAt: clone.LastActiveAt,
 		CreatedAt:    clone.CreatedAt,
 	}
+	if expected != nil {
+		var old tokenStateRecord
+		if err := s.db.DB(ctx).Where("token = ?", record.Token).First(&old).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return core.ErrTokenInvalid
+			}
+			return err
+		}
+		previous, err := decodeTokenState(old.StateJSON)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(previous, expected) {
+			return core.ErrTokenInvalid
+		}
+		result := s.db.DB(ctx).Model(&tokenStateRecord{}).
+			Where("token = ? AND state_json = ? AND (expires_at IS NULL OR expires_at > ?)", record.Token, old.StateJSON, s.now()).
+			Select("kind", "login_id", "login_type", "status", "device", "state_json", "expires_at", "last_active_at", "created_at").Updates(&record)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return core.ErrTokenInvalid
+		}
+		return nil
+	}
 	// token 为主键，重复保存（含主体变更）以全列覆盖更新。
 	return s.db.DB(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "token"}},
@@ -152,7 +197,7 @@ func (s *Store) GetTokenState(ctx context.Context, token core.TokenValue) (*core
 
 	// 过期判定依据落库的 expires_at 列（已编码 ttl 与 state.ExpiresAt 中较早者）。
 	if record.ExpiresAt != nil && !s.now().UTC().Before(record.ExpiresAt.UTC()) {
-		if err := s.db.DB(ctx).Where("token = ?", string(token)).Delete(&tokenStateRecord{}).Error; err != nil {
+		if err := s.db.DB(ctx).Where("token = ? AND state_json = ? AND expires_at <= ?", string(token), record.StateJSON, s.now()).Delete(&tokenStateRecord{}).Error; err != nil {
 			return nil, false, err
 		}
 		return nil, false, nil
@@ -161,6 +206,17 @@ func (s *Store) GetTokenState(ctx context.Context, token core.TokenValue) (*core
 }
 
 func (s *Store) ConsumeTokenState(ctx context.Context, token core.TokenValue) (*core.TokenState, bool, error) {
+	return s.consumeTokenState(ctx, token, "")
+}
+
+func (s *Store) ConsumeTokenStateOfKind(ctx context.Context, token core.TokenValue, kind core.TokenKind) (*core.TokenState, bool, error) {
+	if kind == "" {
+		return nil, false, core.ErrUnsupportedKind
+	}
+	return s.consumeTokenState(ctx, token, kind)
+}
+
+func (s *Store) consumeTokenState(ctx context.Context, token core.TokenValue, kind core.TokenKind) (*core.TokenState, bool, error) {
 	if err := contextErr(ctx); err != nil {
 		return nil, false, err
 	}
@@ -195,7 +251,7 @@ func (s *Store) ConsumeTokenState(ctx context.Context, token core.TokenValue) (*
 		found = true
 		// 返回消费前快照。
 		state = decoded.Clone()
-		if !decoded.IsActive(now) {
+		if !decoded.IsActive(now) || (kind != "" && decoded.Kind != kind) {
 			return nil
 		}
 
@@ -206,7 +262,7 @@ func (s *Store) ConsumeTokenState(ctx context.Context, token core.TokenValue) (*
 			return err
 		}
 		result := tx.Model(&tokenStateRecord{}).
-			Where("token = ? AND status = ?", string(token), string(core.TokenStatusActive)).
+			Where("token = ? AND (status = ? OR status = '' OR status IS NULL) AND state_json = ? AND (expires_at IS NULL OR expires_at > ?)", string(token), string(core.TokenStatusActive), record.StateJSON, now).
 			Updates(map[string]any{"status": string(core.TokenStatusConsumed), "state_json": data})
 		if result.Error != nil {
 			return result.Error
@@ -228,6 +284,9 @@ func (s *Store) ConsumeTokenState(ctx context.Context, token core.TokenValue) (*
 			reloaded, err := decodeTokenState(current.StateJSON)
 			if err != nil {
 				return err
+			}
+			if reloaded.IsActive(now) && (kind == "" || reloaded.Kind == kind) {
+				return core.ErrTokenInvalid
 			}
 			state = reloaded.Clone()
 		}
@@ -327,6 +386,37 @@ func (s *Store) SaveSession(ctx context.Context, session *core.Session, ttl time
 	}).Create(&record).Error
 }
 
+func (s *Store) EnsureSession(ctx context.Context, subject core.LoginSubject, ttl time.Duration) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	subject = subject.Normalize()
+	if subject.IsZero() {
+		return core.ErrEmptySessionID
+	}
+	now := s.now().UTC()
+	var expires *time.Time
+	if ttl > 0 {
+		deadline := now.Add(ttl)
+		expires = &deadline
+	}
+	data, err := json.Marshal(core.NewSessionForSubject(subject))
+	if err != nil {
+		return err
+	}
+	record := sessionRecord{LoginID: subject.LoginID, LoginType: subject.LoginType, DataJSON: data, ExpiresAt: expires, CreatedAt: now}
+	// One upsert: reset only an expired row, otherwise preserve its data. Updating
+	// expires_at last keeps the CASE expressions bound to the previous lifetime.
+	return s.db.DB(ctx).Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "login_id"}, {Name: "login_type"}},
+		DoUpdates: clause.Set{
+			{Column: clause.Column{Name: "data_json"}, Value: clause.Expr{SQL: "CASE WHEN expires_at IS NOT NULL AND expires_at <= ? THEN ? ELSE data_json END", Vars: []any{now, data}}},
+			{Column: clause.Column{Name: "created_at"}, Value: clause.Expr{SQL: "CASE WHEN expires_at IS NOT NULL AND expires_at <= ? THEN ? ELSE created_at END", Vars: []any{now, now}}},
+			{Column: clause.Column{Name: "expires_at"}, Value: expires},
+		},
+	}).Create(&record).Error
+}
+
 func (s *Store) GetSession(ctx context.Context, subject core.LoginSubject) (*core.Session, bool, error) {
 	if err := contextErr(ctx); err != nil {
 		return nil, false, err
@@ -346,7 +436,7 @@ func (s *Store) GetSession(ctx context.Context, subject core.LoginSubject) (*cor
 
 	if record.ExpiresAt != nil && !s.now().UTC().Before(record.ExpiresAt.UTC()) {
 		if err := s.db.DB(ctx).
-			Where("login_id = ? AND login_type = ?", key.LoginID, key.LoginType).
+			Where("login_id = ? AND login_type = ? AND expires_at <= ?", key.LoginID, key.LoginType, s.now()).
 			Delete(&sessionRecord{}).Error; err != nil {
 			return nil, false, err
 		}

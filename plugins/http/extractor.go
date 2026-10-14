@@ -18,14 +18,20 @@ func NewExtractor(opts ...Option) Extractor {
 		opts: options{
 			tokenName:        core.DefaultTokenName,
 			authorizationKey: plugins.DefaultAuthorizationKey,
+			readCookie:       true,
+			cookieConfig:     DefaultCookieConfig(),
 		},
 	}
+	extractor.opts.cookieConfig.Name = ""
 	option.Apply(&extractor.opts, opts...)
 	if extractor.opts.tokenName == "" {
 		extractor.opts.tokenName = core.DefaultTokenName
 	}
 	if extractor.opts.authorizationKey == "" {
 		extractor.opts.authorizationKey = plugins.DefaultAuthorizationKey
+	}
+	if extractor.opts.cookieConfig.Name == "" {
+		extractor.opts.cookieConfig.Name = extractor.opts.tokenName
 	}
 	extractor.lookup = plugins.TokenLookup{
 		TokenName:        extractor.opts.tokenName,
@@ -52,16 +58,16 @@ func (e Extractor) ExtractToken(r *http.Request) (core.TokenValue, bool) {
 	if r == nil {
 		return "", false
 	}
-	return e.lookup.Resolve(plugins.Getters{
-		Header: r.Header.Get,
-		Cookie: func(key string) string {
-			if cookie, err := r.Cookie(key); err == nil {
-				return cookie.Value
+	var cookie func(string) string
+	if e.opts.readCookie {
+		cookie = func(string) string {
+			if value, err := r.Cookie(e.opts.cookieConfig.Name); err == nil {
+				return value.Value
 			}
 			return ""
-		},
-		Query: r.URL.Query().Get,
-	})
+		}
+	}
+	return e.lookup.Resolve(plugins.Getters{Header: r.Header.Get, Cookie: cookie, Query: r.URL.Query().Get})
 }
 
 func (e Extractor) Unauthorized() func(http.ResponseWriter, *http.Request) {

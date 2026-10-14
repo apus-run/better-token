@@ -53,10 +53,11 @@ func WithRuntime(runtime Runtime) Option {
 type LoginOption = option.Option[loginOptions]
 
 type loginOptions struct {
-	loginType string
-	device    string
-	metadata  json.RawMessage
-	nonce     TokenValue
+	loginType       string
+	device          string
+	metadata        json.RawMessage
+	nonce           TokenValue
+	preserveRefresh TokenValue
 }
 
 func WithLoginType(loginType string) LoginOption {

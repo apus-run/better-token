@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	gonic "github.com/gin-gonic/gin"
 
@@ -81,5 +82,35 @@ func TestGinMiddlewareUsesCustomUnauthorizedHandler(t *testing.T) {
 	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/me", nil))
 	if res.Code != http.StatusTeapot {
 		t.Fatalf("missing token status = %d", res.Code)
+	}
+}
+
+func TestGinCookieConfigurationAndReadToggle(t *testing.T) {
+	gonic.SetMode(gonic.TestMode)
+	manager := core.NewManager(memory.NewStore())
+	if _, err := manager.Login(context.Background(), "alice", "cookie-token"); err != nil {
+		t.Fatal(err)
+	}
+	config := DefaultCookieConfig()
+	config.Name = "access"
+	cookieResponse := httptest.NewRecorder()
+	if err := config.SetTokenCookie(cookieResponse, "cookie-token", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	for _, enabled := range []bool{true, false} {
+		router := gonic.New()
+		router.Use(Middleware(manager, WithCookieConfig(config), WithCookieRead(enabled)))
+		router.GET("/me", func(c *gonic.Context) { c.Status(http.StatusNoContent) })
+		request := httptest.NewRequest(http.MethodGet, "/me", nil)
+		request.AddCookie(cookieResponse.Result().Cookies()[0])
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		want := http.StatusUnauthorized
+		if enabled {
+			want = http.StatusNoContent
+		}
+		if response.Code != want {
+			t.Fatalf("enabled=%v status=%d", enabled, response.Code)
+		}
 	}
 }
